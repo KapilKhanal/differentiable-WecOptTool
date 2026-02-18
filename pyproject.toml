@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wecopttool-differentiable"
+version = "0.1.0"
+description = "Fiacco sensitivity and JAX differentiability for WecOptTool"
+readme = "README.md"
+license = {text = "GPL-3.0-only"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Kapil Khanal"},
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "wecopttool",
+    "jax",
+    "cyipopt",
+    "numpy>=1.20",
+    "scipy",
+    "xarray",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "jupyter",
+]
+
+[tool.setuptools.packages.find]
+include = ["wecopttool_differentiable*"]
