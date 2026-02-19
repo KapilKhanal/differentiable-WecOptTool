@@ -12,11 +12,25 @@ Extension package for [WecOptTool](https://github.com/sandialabs/WecOptTool) tha
 ## Installation
 
 ```bash
-pip install wecopttool wecopttool[ipopt]
+pip install wecopttool
 pip install wecopttool-differentiable
 ```
 
-Or install from source:
+If `cyipopt` fails to build from PyPI (deprecated setuptools in older releases), install it from git first:
+
+```bash
+pip install "cyipopt @ git+https://github.com/mechmotum/cyipopt.git"
+pip install wecopttool wecopttool-differentiable
+```
+
+Or use conda for cyipopt (pre-built binaries):
+
+```bash
+conda install -c conda-forge cyipopt
+pip install wecopttool wecopttool-differentiable
+```
+
+To install from source:
 
 ```bash
 pip install -e .

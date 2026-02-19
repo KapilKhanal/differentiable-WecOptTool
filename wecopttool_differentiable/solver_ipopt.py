@@ -137,6 +137,9 @@ class WEC_IPOPT(WEC):
         bounds_wec: Optional[Bounds] = None,
         bounds_opt: Optional[Bounds] = None,
         callback: Optional[TStateFunction] = None,
+        mult_g_0: Optional[ndarray] = None,
+        mult_x_L_0: Optional[ndarray] = None,
+        mult_x_U_0: Optional[ndarray] = None,
     ) -> list[OptimizeResult]:
         """Solve the pseudo-spectral problem using IPOPT.
 
@@ -147,6 +150,8 @@ class WEC_IPOPT(WEC):
         * The returned :class:`~scipy.optimize.OptimizeResult` objects
           carry extra attributes: ``dynamics_mult_g``, ``mult_g``,
           ``constraint_multipliers``, etc.
+        * ``mult_g_0`` enables full dual warm-start (pass
+          ``res.mult_g`` from a previous solve).
         """
         results = []
 
@@ -285,26 +290,95 @@ class WEC_IPOPT(WEC):
             }
             ipopt_opts.update(optim_options)
 
-            _log.info("Calling cyipopt.minimize_ipopt ...")
-            result = cyipopt.minimize_ipopt(
-                fun=obj_fun_scaled,
-                x0=x0,
-                jac=obj_grad,
-                bounds=bounds_list_ipopt,
-                constraints=constraints_ipopt,
-                options=ipopt_opts,
-            )
+            if mult_g_0 is None:
+                _log.info("Calling cyipopt.minimize_ipopt ...")
+                result = cyipopt.minimize_ipopt(
+                    fun=obj_fun_scaled,
+                    x0=x0,
+                    jac=obj_grad,
+                    bounds=bounds_list_ipopt,
+                    constraints=constraints_ipopt,
+                    options=ipopt_opts,
+                )
+                info = result.info
+                r_x = np.asarray(result.x)
+                r_fun = float(result.fun)
+                r_success = result.success
+                r_message = result.message
+                r_status = result.status
+                r_nit = result.nit
+                r_nfev = result.get("nfev", None)
+            else:
+                _log.info(
+                    "Calling cyipopt.Problem.solve with dual warm-start ...")
+                from cyipopt.scipy_interface import (
+                    IpoptProblemWrapper,
+                    get_constraint_bounds,
+                    get_constraint_dimensions,
+                    _get_sparse_jacobian_structure,
+                )
+
+                ipopt_opts.setdefault("warm_start_init_point", "yes")
+                ipopt_opts.setdefault("warm_start_bound_push", 1e-9)
+                ipopt_opts.setdefault("warm_start_bound_frac", 1e-9)
+                ipopt_opts.setdefault("warm_start_mult_bound_push", 1e-9)
+
+                cl, cu = get_constraint_bounds(constraints_ipopt, x0)
+                con_dims = get_constraint_dimensions(constraints_ipopt, x0)
+                sparse_jacs, jac_r, jac_c = (
+                    _get_sparse_jacobian_structure(constraints_ipopt, x0))
+
+                if bounds_list_ipopt is not None:
+                    lb = [b[0] for b in bounds_list_ipopt]
+                    ub = [b[1] for b in bounds_list_ipopt]
+                else:
+                    lb = [-1e19] * len(x0)
+                    ub = [1e19] * len(x0)
+
+                pw = IpoptProblemWrapper(
+                    fun=obj_fun_scaled,
+                    jac=obj_grad,
+                    constraints=constraints_ipopt,
+                    con_dims=con_dims,
+                    sparse_jacs=sparse_jacs,
+                    jac_nnz_row=jac_r,
+                    jac_nnz_col=jac_c,
+                )
+
+                nlp = cyipopt.Problem(
+                    n=len(x0), m=len(cl), problem_obj=pw,
+                    lb=lb, ub=ub, cl=cl, cu=cu,
+                )
+                nlp.add_option(b"hessian_approximation",
+                               b"limited-memory")
+                for k, v in ipopt_opts.items():
+                    try:
+                        nlp.add_option(k, v)
+                    except TypeError:
+                        pass
+
+                zl = list(mult_x_L_0) if mult_x_L_0 is not None \
+                    else list(np.zeros(len(x0)))
+                zu = list(mult_x_U_0) if mult_x_U_0 is not None \
+                    else list(np.zeros(len(x0)))
+                x_sol, info = nlp.solve(
+                    x0, lagrange=list(mult_g_0), zl=zl, zu=zu)
+                r_x = np.asarray(x_sol)
+                r_fun = float(info["obj_val"])
+                r_success = info["status"] == 0
+                r_message = info["status_msg"]
+                r_status = info["status"]
+                r_nit = pw.nit
+                r_nfev = pw.nfev
 
             optim_res = OptimizeResult()
-            optim_res.x = np.asarray(result.x) / np.asarray(scale)
-            optim_res.fun = float(result.fun) / scale_obj
-            optim_res.success = result.success
-            optim_res.message = result.message
-            optim_res.status = result.status
-            optim_res.nit = result.nit
-            optim_res.nfev = result.get("nfev", None)
-
-            info = result.info
+            optim_res.x = r_x / np.asarray(scale)
+            optim_res.fun = r_fun / scale_obj
+            optim_res.success = r_success
+            optim_res.message = r_message
+            optim_res.status = r_status
+            optim_res.nit = r_nit
+            optim_res.nfev = r_nfev
             optim_res.mult_g = np.asarray(info["mult_g"])
             optim_res.mult_x_L = np.asarray(info["mult_x_L"])
             optim_res.mult_x_U = np.asarray(info["mult_x_U"])
@@ -324,8 +398,8 @@ class WEC_IPOPT(WEC):
                     raw_mu / (scale_obj * sign)
                 )
 
-            msg = f"{result.message}  (status {result.status})"
-            if result.success:
+            msg = f"{r_message}  (status {r_status})"
+            if r_success:
                 _log.info(msg)
             else:
                 _log.warning(msg)

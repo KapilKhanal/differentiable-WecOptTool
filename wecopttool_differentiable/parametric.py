@@ -245,11 +245,24 @@ def _inertia_force(time_mat, x_wec, ndof, omega, inertia_matrix):
 # Parametric Residual   r(x_wec, x_opt ; params)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _get_bem_params(params):
-    """Extract BEMParams from params — supports BEMParams or structured pytree."""
+def _get_bem_params(params, wec=None):
+    """Extract BEMParams from params — supports BEMParams or structured pytree.
+
+    For BEM-only: params is BEMParams directly.
+    For joint (BEM+PTO): params has .bem field.
+    For PTO-only (or other non-BEM): params has no .bem; use wec._hydro_data
+    to extract BEM (residual still needs BEM for inertia, radiation, etc.).
+    """
     if hasattr(params, "_fields") and "added_mass" in getattr(params, "_fields", ()):
         return params
-    return params.bem
+    if hasattr(params, "bem"):
+        return params.bem
+    if wec is not None and hasattr(wec, "_hydro_data"):
+        return extract_bem_params(wec._hydro_data)
+    raise ValueError(
+        "params must be BEMParams or have .bem field; "
+        "for PTO-only sensitivity, wec must have _hydro_data."
+    )
 
 
 def residual_parametric(x_wec, x_opt, wave_data, params, wec,
@@ -301,7 +314,7 @@ def residual_parametric(x_wec, x_opt, wave_data, params, wec,
     jax.Array
         Residual vector of length ``ncomponents * ndof``.
     """
-    bem_params = _get_bem_params(params)
+    bem_params = _get_bem_params(params, wec)
     ndof  = wec.ndof
     nfreq = wec.nfreq
     omega = jnp.array(wec.omega[1:])
