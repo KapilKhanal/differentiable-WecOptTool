@@ -238,6 +238,7 @@ NLP_TEST_CASES = [t for t in TEST_CASES if t[0] != "friction"]
 class TestWaveBotNLPValidation:
     """Full IPOPT re-solve FD vs analytical gradient for each BEM parameter."""
 
+    @pytest.mark.validation
     @pytest.mark.parametrize("param_name,idx", NLP_TEST_CASES,
                              ids=[t[0] for t in NLP_TEST_CASES])
     def test_nlp_fd(self, wavebot_setup, param_name, idx):

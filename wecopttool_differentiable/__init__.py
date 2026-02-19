@@ -8,6 +8,33 @@ Extension package for Sandia's WecOptTool. Adds:
 Requires wecopttool and cyipopt.
 """
 
+# -- Tier 1: core solver and sensitivity ------------------------------------
+from .solver_ipopt import (
+    WEC_IPOPT,
+    sensitivity,
+    make_differentiable_solver,
+    sensitivity_parametric,
+)
+
+# -- Tier 2: parametric force / objective factories -------------------------
+from .parametric_utils import (
+    make_joint_params,
+    make_linear_mooring_parametric,
+    make_pto_passive_parametric,
+    make_electrical_power_obj_parametric,
+)
+
+# -- Tier 3: validation utilities -------------------------------------------
+from .validation import (
+    fd_validate,
+    fd_check_residual,
+    fd_check_objective,
+    make_re_solve_fn,
+    validate_sensitivity,
+    FDResult,
+)
+
+# -- Tier 4: advanced / internals ------------------------------------------
 from .parametric import (
     BEMParams,
     WaveData,
@@ -15,47 +42,37 @@ from .parametric import (
     extract_wave_data,
     residual_parametric,
 )
-from .solver_ipopt import (
-    WEC_IPOPT,
-    make_differentiable_solver,
-    sensitivity,
-    sensitivity_parametric,
-)
 from .sensitivity_plots import (
     plot_sensitivity_bars,
     plot_frequency_sensitivity,
     plot_fd_comparison,
 )
-from .parametric_utils import (
-    make_linear_mooring_parametric,
-    make_pto_passive_parametric,
-    make_electrical_power_obj_parametric,
-)
-from .validation import (
-    fd_validate,
-    fd_check_residual,
-    fd_check_objective,
-    FDResult,
-)
 
 __all__ = [
+    # Tier 1 — core
+    "WEC_IPOPT",
+    "sensitivity",
+    "make_differentiable_solver",
+    "sensitivity_parametric",
+    # Tier 2 — parametric factories
+    "make_joint_params",
+    "make_linear_mooring_parametric",
+    "make_pto_passive_parametric",
+    "make_electrical_power_obj_parametric",
+    # Tier 3 — validation
+    "fd_validate",
+    "fd_check_residual",
+    "fd_check_objective",
+    "make_re_solve_fn",
+    "validate_sensitivity",
+    "FDResult",
+    # Tier 4 — advanced / internals
     "BEMParams",
     "WaveData",
     "extract_bem_params",
     "extract_wave_data",
     "residual_parametric",
-    "WEC_IPOPT",
-    "make_differentiable_solver",
-    "sensitivity",
-    "sensitivity_parametric",
     "plot_sensitivity_bars",
     "plot_frequency_sensitivity",
     "plot_fd_comparison",
-    "make_linear_mooring_parametric",
-    "make_pto_passive_parametric",
-    "make_electrical_power_obj_parametric",
-    "fd_validate",
-    "fd_check_residual",
-    "fd_check_objective",
-    "FDResult",
 ]

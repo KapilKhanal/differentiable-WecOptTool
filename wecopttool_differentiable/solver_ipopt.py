@@ -5,8 +5,8 @@ This module provides :class:`WEC_IPOPT`, a subclass of
 IPOPT (via `cyipopt <https://cyipopt.readthedocs.io>`_).
 
 The key advantage is that IPOPT returns **Lagrange multipliers** for
-every constraint, which are needed for Fiacco-style parametric
-sensitivity:
+every constraint, which are needed for  parametric
+sensitivity I am considering here see Fiacco/ Sobieski  sensitivity:
 
 .. math::
 
@@ -40,6 +40,7 @@ __all__ = [
 ]
 
 import logging
+import warnings
 from typing import Optional, Mapping, Any, Iterable, Union
 from pathlib import Path
 
@@ -408,6 +409,30 @@ class WEC_IPOPT(WEC):
 
         return results
 
+    def compute_sensitivity(self, results, waves, **kwargs):
+        """Compute Fiacco sensitivity :math:`d\\varphi^*/dp`.
+
+        Convenience wrapper around the module-level :func:`sensitivity`
+        function so that users can call ``wec.compute_sensitivity(res, waves)``
+        without a separate import.
+
+        Parameters
+        ----------
+        results : OptimizeResult or list[OptimizeResult]
+            Result(s) from :meth:`solve`.
+        waves : xarray.DataArray
+            Wave data used in the solve.
+        **kwargs
+            Forwarded to :func:`sensitivity` (e.g. *params*,
+            *parametric_forces*, *obj_fn*).
+
+        Returns
+        -------
+        pytree
+            Gradient with the same structure as *params*.
+        """
+        return sensitivity(self, results, waves, **kwargs)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Standalone sensitivity functions (Option B)
@@ -473,6 +498,36 @@ def sensitivity(
 
     if isinstance(results, OptimizeResult):
         results = [results]
+
+    for idx, res in enumerate(results):
+        if not hasattr(res, "dynamics_mult_g"):
+            raise AttributeError(
+                f"results[{idx}] is missing 'dynamics_mult_g'. "
+                "Use WEC_IPOPT.solve() (not WEC.solve) to obtain "
+                "Lagrange multipliers.")
+
+    if params is not None and isinstance(params, dict):
+        raise TypeError(
+            "params must be a namedtuple (JAX pytree), not a plain dict. "
+            "Use collections.namedtuple or make_joint_params() to create "
+            "a structured parameter container.")
+
+    if parametric_forces is not None:
+        for k, v in parametric_forces.items():
+            if not callable(v):
+                raise TypeError(
+                    f"parametric_forces['{k}'] is not callable. "
+                    "Each value must be a function with signature "
+                    "(wec, x_wec, x_opt, wave_data, params).")
+
+    if (params is not None
+            and parametric_forces is None
+            and residual_fn is None):
+        raise ValueError(
+            "When params is provided, you must also pass either "
+            "'parametric_forces' (preferred) or 'residual_fn' (legacy). "
+            "Example: sensitivity(wec, res, waves, params=my_params, "
+            "parametric_forces={'PTO': f_pto_parametric})")
 
     wave_data_list, wave_list = _extract_all_realizations(
         waves, wec._hydro_data["Froude_Krylov_force"])
@@ -568,6 +623,12 @@ def sensitivity(
             "sensitivity(params=...) requires parametric_forces or residual_fn.  "
             "Pass parametric_forces dict or residual_fn for legacy API.")
 
+    if additional_forces is None and hasattr(wec, 'forces'):
+        additional_forces = {
+            k: v for k, v in wec.forces.items()
+            if k not in parametric_forces
+        }
+
     def _wrap_force(f, wave):
         return lambda wec, xw, xo, wd: f(wec, xw, xo, wave)
 
@@ -640,9 +701,17 @@ def sensitivity_parametric(
 ):
     r"""Compute Fiacco sensitivity for arbitrary parameters (legacy API).
 
-    Forwards to :func:`sensitivity` with ``residual_fn=...``.
-    Prefer the unified :func:`sensitivity` with ``parametric_forces``.
+    .. deprecated::
+        Use :func:`sensitivity` with ``parametric_forces`` instead.
+        This wrapper will be removed in a future release.
     """
+    warnings.warn(
+        "sensitivity_parametric() is deprecated. "
+        "Use sensitivity(wec, results, waves, params=..., "
+        "parametric_forces=...) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return sensitivity(
         wec, results, waves, params=params,
         residual_fn=residual_fn, obj_fn=obj_fn, constraint_fns=constraint_fns,

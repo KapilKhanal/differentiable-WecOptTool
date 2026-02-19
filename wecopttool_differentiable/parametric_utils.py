@@ -9,14 +9,46 @@ functions.
 from __future__ import annotations
 
 __all__ = [
+    "make_joint_params",
     "make_linear_mooring_parametric",
     "make_pto_passive_parametric",
     "make_electrical_power_obj_parametric",
 ]
 
+from collections import namedtuple
 from typing import Dict
 
 import jax.numpy as jnp
+
+
+def make_joint_params(bem_params, **named_groups):
+    """Create a joint parameter pytree combining BEM and other parameter groups.
+
+    Returns a ``JointParams`` namedtuple with a ``bem`` field and one field
+    per keyword argument, registered as a JAX pytree via the namedtuple
+    convention.
+
+    Parameters
+    ----------
+    bem_params : BEMParams
+        BEM parameters from :func:`extract_bem_params`.
+    **named_groups
+        Additional parameter groups (e.g. ``pto=pto_params``).
+
+    Returns
+    -------
+    namedtuple
+        ``JointParams(bem=..., pto=..., ...)``
+
+    Examples
+    --------
+    >>> joint = make_joint_params(bem_params, pto=pto_params)
+    >>> joint.bem   # BEMParams
+    >>> joint.pto   # PTOParams
+    """
+    fields = ["bem"] + sorted(named_groups.keys())
+    JointParams = namedtuple("JointParams", fields)
+    return JointParams(bem=bem_params, **named_groups)
 
 
 def make_linear_mooring_parametric():

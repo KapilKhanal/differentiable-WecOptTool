@@ -21,6 +21,8 @@ Run with::
     pytest tests/test_aquaharmonics_sensitivity.py -v
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import jax
@@ -31,13 +33,18 @@ import wecopttool as wot
 from wecopttool_differentiable import (
     WEC_IPOPT,
     sensitivity,
+    sensitivity_parametric,
     BEMParams,
     extract_bem_params,
     extract_wave_data,
     residual_parametric,
+    make_joint_params,
     make_linear_mooring_parametric,
     make_pto_passive_parametric,
     make_electrical_power_obj_parametric,
+    fd_check_residual,
+    fd_check_objective,
+    validate_sensitivity,
 )
 from wecopttool.core import frequency_parameters, standard_forces
 
@@ -521,6 +528,7 @@ class TestAquaHarmonicsNLPResolve:
     converging reliably on this tightly-constrained problem.
     """
 
+    @pytest.mark.validation
     @pytest.mark.parametrize("param_name", PTOParams._fields)
     def test_nlp_fd_pto(self, ah_setup, param_name):
         s = ah_setup
@@ -668,3 +676,228 @@ class TestAquaHarmonicsNLPResolve:
             f"status={res_p.status}, {res_p.message}"
         )
         return res_p.fun
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. Auto-partition forces (no explicit additional_forces)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAutoPartitionForces:
+    """sensitivity() auto-computes additional_forces from wec.forces."""
+
+    def test_auto_partition_matches_explicit(self, ah_setup):
+        s = ah_setup
+        force_kw_explicit = dict(
+            parametric_forces={"PTO_passive": s["f_pto_passive_parametric"]},
+            additional_forces={
+                k: v for k, v in s["wec"].forces.items()
+                if k != "PTO_passive"
+            },
+            obj_fn=s["obj_pto_parametric"],
+        )
+        grad_explicit = sensitivity(
+            s["wec"], s["res"], s["waves"],
+            params=s["pto_params_nominal"], **force_kw_explicit,
+        )
+
+        grad_auto = sensitivity(
+            s["wec"], s["res"], s["waves"],
+            params=s["pto_params_nominal"],
+            parametric_forces={"PTO_passive": s["f_pto_passive_parametric"]},
+            obj_fn=s["obj_pto_parametric"],
+        )
+
+        for name in PTOParams._fields:
+            np.testing.assert_allclose(
+                float(getattr(grad_auto, name)),
+                float(getattr(grad_explicit, name)),
+                rtol=1e-10,
+                err_msg=f"Auto-partition mismatch for {name}",
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. WEC_IPOPT.compute_sensitivity() convenience method
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestComputeSensitivityMethod:
+    """wec.compute_sensitivity() delegates to module-level sensitivity()."""
+
+    def test_method_matches_function(self, ah_setup):
+        s = ah_setup
+        grad_fn = sensitivity(s["wec"], s["res"], s["waves"])
+        grad_method = s["wec"].compute_sensitivity(s["res"], s["waves"])
+
+        for name in BEMParams._fields:
+            np.testing.assert_allclose(
+                np.array(getattr(grad_method, name)),
+                np.array(getattr(grad_fn, name)),
+                atol=1e-12,
+                err_msg=f"compute_sensitivity() mismatch for {name}",
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. make_joint_params helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMakeJointParams:
+    """make_joint_params creates a valid JAX pytree."""
+
+    def test_joint_params_fields(self, ah_setup):
+        s = ah_setup
+        joint = make_joint_params(
+            s["bem_params"], pto=s["pto_params_nominal"])
+        assert hasattr(joint, "bem")
+        assert hasattr(joint, "pto")
+
+    def test_joint_params_in_sensitivity(self, ah_setup):
+        s = ah_setup
+        joint = make_joint_params(
+            s["bem_params"], pto=s["pto_params_nominal"])
+
+        grad_joint = sensitivity(
+            s["wec"], s["res"], s["waves"],
+            params=joint,
+            parametric_forces={"PTO_passive": s["f_pto_passive_parametric"]},
+            obj_fn=s["obj_pto_parametric"],
+        )
+        assert hasattr(grad_joint, "bem")
+        assert hasattr(grad_joint, "pto")
+        for name in PTOParams._fields:
+            g = float(getattr(grad_joint.pto, name))
+            assert np.isfinite(g), f"Non-finite in joint.pto.{name}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 10. Constraint multipliers are present and structured
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestConstraintMultipliers:
+    """Result carries constraint_multipliers dict with expected keys."""
+
+    def test_constraint_multipliers_populated(self, ah_setup):
+        s = ah_setup
+        res = s["res"]
+        assert hasattr(res, "constraint_multipliers")
+        assert len(res.constraint_multipliers) > 0
+
+    def test_dynamics_multiplier_shape(self, ah_setup):
+        s = ah_setup
+        res = s["res"]
+        assert res.dynamics_mult_g.shape == (s["wec"].nstate_wec,)
+
+    def test_user_constraint_keys(self, ah_setup):
+        s = ah_setup
+        res = s["res"]
+        for i in range(5):
+            key = f"user_constraint_{i}"
+            assert key in res.constraint_multipliers or key == "user_constraint_4", \
+                f"Missing constraint multiplier for {key}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 11. Validation utilities integration (fd_check_residual, fd_check_objective)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestValidationUtilitiesIntegration:
+    """fd_check_residual and fd_check_objective pass on real data."""
+
+    @pytest.mark.validation
+    def test_fd_check_residual_passes(self, ah_setup):
+        s = ah_setup
+        results = fd_check_residual(
+            s["wec"], s["res"], s["waves"],
+            s["pto_params_nominal"],
+            parametric_forces={"PTO_passive": s["f_pto_passive_parametric"]},
+            fields=["friction_pto", "inertia_pto", "spring_stiffness"],
+            tol=0.05,
+            verbose=True,
+        )
+        for name, r in results.items():
+            assert r.passed, (
+                f"fd_check_residual failed for {name}: "
+                f"analytical={r.analytical:.6e}, fd={r.fd:.6e}, "
+                f"rel_error={r.rel_error:.2e}"
+            )
+
+    @pytest.mark.validation
+    def test_fd_check_objective_passes(self, ah_setup):
+        s = ah_setup
+        results = fd_check_objective(
+            s["wec"], s["res"], s["waves"],
+            s["pto_params_nominal"],
+            obj_fn=s["obj_pto_parametric"],
+            fields=["winding_resistance", "torque_coefficient"],
+            tol=0.05,
+            verbose=True,
+        )
+        for name, r in results.items():
+            assert r.passed, (
+                f"fd_check_objective failed for {name}: "
+                f"analytical={r.analytical:.6e}, fd={r.fd:.6e}, "
+                f"rel_error={r.rel_error:.2e}"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 12. Deprecation warning for sensitivity_parametric
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDeprecationWarning:
+    """sensitivity_parametric emits DeprecationWarning."""
+
+    def test_sensitivity_parametric_warns(self, ah_setup):
+        s = ah_setup
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            sensitivity_parametric(
+                s["wec"], s["res"], s["waves"],
+                params=s["pto_params_nominal"],
+                residual_fn=lambda wec, xw, xo, wave, p:
+                    jnp.zeros(wec.nstate_wec),
+            )
+            assert len(w) >= 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "sensitivity_parametric" in str(w[0].message)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 13. Input validation error messages
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestInputValidation:
+    """sensitivity() raises clear errors on bad inputs."""
+
+    def test_missing_dynamics_mult_g(self, ah_setup):
+        from scipy.optimize import OptimizeResult
+        s = ah_setup
+        bad_res = OptimizeResult(x=s["res"].x, fun=s["res"].fun)
+        with pytest.raises(AttributeError, match="dynamics_mult_g"):
+            sensitivity(s["wec"], bad_res, s["waves"])
+
+    def test_dict_params_rejected(self, ah_setup):
+        s = ah_setup
+        with pytest.raises(TypeError, match="namedtuple"):
+            sensitivity(
+                s["wec"], s["res"], s["waves"],
+                params={"friction_pto": 100.0},
+                parametric_forces={"PTO_passive": s["f_pto_passive_parametric"]},
+            )
+
+    def test_non_callable_parametric_force(self, ah_setup):
+        s = ah_setup
+        with pytest.raises(TypeError, match="not callable"):
+            sensitivity(
+                s["wec"], s["res"], s["waves"],
+                params=s["pto_params_nominal"],
+                parametric_forces={"PTO_passive": "not_a_function"},
+            )
+
+    def test_params_without_forces_rejected(self, ah_setup):
+        s = ah_setup
+        with pytest.raises(ValueError, match="parametric_forces"):
+            sensitivity(
+                s["wec"], s["res"], s["waves"],
+                params=s["pto_params_nominal"],
+            )

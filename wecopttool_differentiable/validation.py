@@ -19,6 +19,8 @@ __all__ = [
     "fd_validate",
     "fd_check_residual",
     "fd_check_objective",
+    "make_re_solve_fn",
+    "validate_sensitivity",
 ]
 
 import logging
@@ -346,3 +348,164 @@ def _print_table(results: Dict[str, FDResult], tol: float):
         n_fail = sum(1 for r in results.values() if not r.passed)
         print(f"  {n_fail} parameter(s) FAILED (tol={tol:.0%})")
     print()
+
+
+def make_re_solve_fn(wec_factory, waves, obj_fun, nstate_opt, **solve_kwargs):
+    """Build a ``re_solve_fn`` for use with :func:`fd_validate`.
+
+    Wraps the boilerplate of rebuilding a WEC and re-solving the NLP
+    at perturbed parameters into a single callable.
+
+    Parameters
+    ----------
+    wec_factory : callable
+        ``wec_factory(params_dict) -> WEC_IPOPT`` — creates a new
+        WEC instance from a parameter dict (keyed by field name).
+    waves : xarray.DataArray
+        Wave data.
+    obj_fun : callable
+        Objective function passed to :meth:`WEC_IPOPT.solve`.
+    nstate_opt : int
+        Number of optimisation state variables.
+    **solve_kwargs
+        Extra keyword arguments forwarded to :meth:`WEC_IPOPT.solve`
+        (e.g. ``scale_x_wec``, ``optim_options``, ``x_wec_0``).
+
+    Returns
+    -------
+    callable
+        ``re_solve_fn(params_dict) -> float`` suitable for
+        :func:`fd_validate`.
+    """
+    def re_solve(params_dict):
+        wec_new = wec_factory(params_dict)
+        results = wec_new.solve(waves, obj_fun, nstate_opt, **solve_kwargs)
+        return float(results[0].fun)
+    return re_solve
+
+
+def validate_sensitivity(
+    wec,
+    results,
+    waves,
+    analytical_grad,
+    params=None,
+    *,
+    parametric_forces=None,
+    additional_forces=None,
+    obj_fn=None,
+    re_solve_fn=None,
+    fields=None,
+    residual_tol: float = 0.05,
+    objective_tol: float = 0.05,
+    resolve_tol: float = 0.10,
+    verbose: bool = True,
+) -> Dict[str, Dict[str, FDResult]]:
+    """Run all applicable FD validation checks and return a summary.
+
+    Automatically selects which checks to run based on the arguments
+    provided:
+
+    - **Residual check** — runs when *params* and *parametric_forces*
+      are given (validates :math:`\\lambda^T \\partial r / \\partial p`).
+    - **Objective check** — runs when *params* and *obj_fn* are given
+      (validates :math:`\\partial f / \\partial p`).
+    - **Full NLP re-solve** — runs when *re_solve_fn* is given
+      (validates the complete Fiacco gradient).
+
+    Parameters
+    ----------
+    wec : WEC_IPOPT
+        WEC instance.
+    results : OptimizeResult or list[OptimizeResult]
+        Result(s) from :meth:`WEC_IPOPT.solve`.
+    waves : xarray.DataArray
+        Wave data.
+    analytical_grad : namedtuple / pytree
+        Gradient returned by :func:`sensitivity`.
+    params : namedtuple, optional
+        Nominal parameter values.
+    parametric_forces : dict, optional
+        Parametric force dict (same as passed to :func:`sensitivity`).
+    additional_forces : dict, optional
+        Non-parametric forces.
+    obj_fn : callable, optional
+        Parametric objective function.
+    re_solve_fn : callable, optional
+        ``re_solve_fn(params_dict) -> float`` for full NLP re-solve
+        (see :func:`make_re_solve_fn`).
+    fields : sequence of str, optional
+        Parameter fields to check (default: all).
+    residual_tol, objective_tol, resolve_tol : float
+        Tolerance for each check level.
+    verbose : bool
+        Print comparison tables.
+
+    Returns
+    -------
+    dict[str, dict[str, FDResult]]
+        Nested dict keyed by check name (``'residual'``, ``'objective'``,
+        ``'resolve'``), each containing per-parameter :class:`FDResult`.
+    """
+    from scipy.optimize import OptimizeResult
+
+    if isinstance(results, OptimizeResult):
+        results = [results]
+    res = results[0]
+
+    report: Dict[str, Dict[str, FDResult]] = {}
+
+    if params is not None and parametric_forces is not None:
+        if verbose:
+            print("=" * 74)
+            print("  Residual Jacobian check: lambda^T (dr/dp)")
+            print("=" * 74)
+        report["residual"] = fd_check_residual(
+            wec, res, waves, params,
+            parametric_forces=parametric_forces,
+            additional_forces=additional_forces,
+            fields=fields,
+            tol=residual_tol,
+            verbose=verbose,
+        )
+
+    if params is not None and obj_fn is not None:
+        if verbose:
+            print("=" * 74)
+            print("  Objective gradient check: df/dp")
+            print("=" * 74)
+        report["objective"] = fd_check_objective(
+            wec, res, waves, params,
+            obj_fn=obj_fn,
+            fields=fields,
+            tol=objective_tol,
+            verbose=verbose,
+        )
+
+    if re_solve_fn is not None and params is not None:
+        if verbose:
+            print("=" * 74)
+            print("  Full NLP re-solve check: d(phi*)/dp")
+            print("=" * 74)
+        report["resolve"] = fd_validate(
+            analytical_grad, params, re_solve_fn,
+            fields=fields,
+            tol=resolve_tol,
+            verbose=verbose,
+        )
+
+    if verbose:
+        total = sum(len(v) for v in report.values())
+        failed = sum(
+            1 for checks in report.values()
+            for r in checks.values() if not r.passed
+        )
+        print("=" * 74)
+        if failed == 0:
+            print(f"  SUMMARY: All {total} checks passed.")
+        else:
+            print(f"  SUMMARY: {failed}/{total} checks FAILED.")
+        print("=" * 74)
+        print()
+
+    return report

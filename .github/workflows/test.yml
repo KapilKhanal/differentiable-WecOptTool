@@ -23,5 +23,7 @@ jobs:
         run: |
           conda install -y -c conda-forge wecopttool cyipopt pytest
           pip install -e .
-      - name: Run tests
-        run: pytest tests/ -v --tb=short
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short -m "not validation"
+      - name: Run sensitivity validation tests
+        run: pytest tests/ -v --tb=short -m "validation"

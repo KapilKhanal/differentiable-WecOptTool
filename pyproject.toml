@@ -32,5 +32,10 @@ dev = [
     "jupyter",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "validation: expensive FD re-solve validation tests (may take minutes)",
+]
+
 [tool.setuptools.packages.find]
 include = ["wecopttool_differentiable*"]
