@@ -454,6 +454,19 @@ def _extract_all_realizations(waves, exc_coeff_da):
         return [wd], [waves]
 
 
+def _fix_complex_grad(grad):
+    """Conjugate complex leaves so Im(grad) = d/d(Im param).
+
+    JAX's VJP convention for complex inputs with real-valued output is
+    ``bar_z = df/d(Re z) − i·df/d(Im z)``.  Users expect
+    ``grad = df/d(Re z) + i·df/d(Im z)``, so we conjugate complex leaves.
+    """
+    return jax.tree_util.tree_map(
+        lambda x: jnp.conj(x) if jnp.iscomplexobj(x) else x,
+        grad,
+    )
+
+
 def sensitivity(
     wec,
     results,
@@ -490,6 +503,9 @@ def sensitivity(
     -------
     pytree
         Gradient with same structure as *params* (BEMParams when params=None).
+        For complex-valued parameters (e.g. Froude-Krylov, diffraction),
+        ``Re(grad)`` = sensitivity to real part, ``Im(grad)`` = sensitivity
+        to imaginary part.
     """
     if not hasattr(wec, "_hydro_data"):
         raise AttributeError(
@@ -569,7 +585,8 @@ def sensitivity(
                 total_grad = jax.tree_util.tree_map(
                     jnp.add, total_grad, grad_i)
 
-        return jax.tree_util.tree_map(lambda x: x / nreal, total_grad)
+        avg = jax.tree_util.tree_map(lambda x: x / nreal, total_grad)
+        return _fix_complex_grad(avg)
 
     if residual_fn is not None:
         total_grad = None
@@ -616,7 +633,8 @@ def sensitivity(
                 total_grad = jax.tree_util.tree_map(
                     jnp.add, total_grad, grad_total)
 
-        return jax.tree_util.tree_map(lambda x: x / nreal, total_grad)
+        avg = jax.tree_util.tree_map(lambda x: x / nreal, total_grad)
+        return _fix_complex_grad(avg)
 
     if parametric_forces is None:
         raise ValueError(
@@ -692,7 +710,8 @@ def sensitivity(
             total_grad = jax.tree_util.tree_map(
                 jnp.add, total_grad, grad_total)
 
-    return jax.tree_util.tree_map(lambda x: x / nreal, total_grad)
+    avg = jax.tree_util.tree_map(lambda x: x / nreal, total_grad)
+    return _fix_complex_grad(avg)
 
 
 def sensitivity_parametric(
@@ -823,8 +842,9 @@ def make_differentiable_solver(
                 total_grad = jax.tree_util.tree_map(
                     jnp.add, total_grad, grad_i)
 
-        return (jax.tree_util.tree_map(
-            lambda x: g * x / nreal, total_grad),)
+        avg = jax.tree_util.tree_map(
+            lambda x: g * x / nreal, total_grad)
+        return (_fix_complex_grad(avg),)
 
     solve.defvjp(solve_fwd, solve_bwd)
     solve.warm_start_state = _warm

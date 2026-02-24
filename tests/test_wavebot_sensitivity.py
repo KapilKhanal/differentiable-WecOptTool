@@ -122,6 +122,9 @@ def wavebot_setup():
 
     _, vjp_fn = jax.vjp(r_of_h, bp)
     (grad_h,) = vjp_fn(lam)
+    # Fix JAX complex VJP convention: conjugate complex leaves
+    grad_h = jax.tree_util.tree_map(
+        lambda x: jnp.conj(x) if jnp.iscomplexobj(x) else x, grad_h)
 
     return dict(
         wec=wec, waves=waves, wave=wave, res=res, bem_data=bem_data,

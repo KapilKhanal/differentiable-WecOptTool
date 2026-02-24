@@ -240,6 +240,9 @@ class TestSensitivityMethod:
 
         _, vjp_fn = jax.vjp(r_of_h, bp)
         (grad_manual,) = vjp_fn(lam)
+        # Fix JAX complex VJP convention: conjugate complex leaves
+        grad_manual = jax.tree_util.tree_map(
+            lambda x: jnp.conj(x) if jnp.iscomplexobj(x) else x, grad_manual)
 
         for name in BEMParams._fields:
             np.testing.assert_allclose(

@@ -31,7 +31,9 @@ from .validation import (
     fd_check_objective,
     make_re_solve_fn,
     validate_sensitivity,
+    check_regularity,
     FDResult,
+    RegularityResult,
 )
 
 # -- Tier 4: advanced / internals ------------------------------------------
@@ -65,7 +67,9 @@ __all__ = [
     "fd_check_objective",
     "make_re_solve_fn",
     "validate_sensitivity",
+    "check_regularity",
     "FDResult",
+    "RegularityResult",
     # Tier 4 — advanced / internals
     "BEMParams",
     "WaveData",

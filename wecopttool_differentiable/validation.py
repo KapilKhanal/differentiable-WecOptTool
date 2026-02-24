@@ -1,6 +1,6 @@
-"""Finite-difference validation utilities for sensitivity analysis.
+"""Validation utilities for Fiacco post-optimality sensitivity analysis.
 
-Three levels of checking:
+Finite-difference validation (three levels):
 
 1. :func:`fd_validate` — **end-to-end**: re-solve the NLP at perturbed
    parameters and compare ``(phi*(p+eps) - phi*(p-eps)) / 2eps`` against
@@ -11,6 +11,11 @@ Three levels of checking:
 
 3. :func:`fd_check_objective` — verify ``df/dp`` against FD of the
    objective.  No re-solve needed.
+
+NLP regularity checks (required for Fiacco theorem validity):
+
+4. :func:`check_regularity` — verify LICQ, strict complementarity,
+   SOSC, and active-set stability at the optimal solution.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ __all__ = [
     "fd_check_objective",
     "make_re_solve_fn",
     "validate_sensitivity",
+    "check_regularity",
 ]
 
 import logging
@@ -29,6 +35,7 @@ from typing import Callable, Dict, Optional, Sequence, NamedTuple
 import numpy as np
 import jax
 import jax.numpy as jnp
+from scipy import linalg as la
 
 _log = logging.getLogger(__name__)
 
@@ -509,3 +516,333 @@ def validate_sensitivity(
         print()
 
     return report
+
+
+# ════════════════════════════════════════════════════════════════════════
+# NLP regularity checks for Fiacco sensitivity validity
+# ════════════════════════════════════════════════════════════════════════
+
+class RegularityResult(NamedTuple):
+    """Result of NLP regularity checks at an optimal solution.
+
+    Attributes
+    ----------
+    licq : bool
+        LICQ holds — active constraint gradients are linearly independent.
+    licq_sigma_min : float
+        Smallest singular value of the active constraint Jacobian.
+        Values near zero indicate near-violation of LICQ.
+    strict_complementarity : bool
+        Every active inequality constraint has a nonzero multiplier.
+    sc_min_active_mult : float
+        Smallest |multiplier| among active inequality constraints.
+    sc_degenerate : list[str]
+        Names of constraints that are active but have near-zero multiplier.
+    sosc : bool
+        Reduced Hessian of the Lagrangian is positive (semi)definite
+        on the null space of the active constraint Jacobian.
+    sosc_min_eigenvalue : float
+        Smallest eigenvalue of the reduced Hessian.
+    active_set_summary : dict
+        ``{'n_active_ineq': int, 'n_total_ineq': int,
+        'n_dynamics': int, 'active_names': list}``.
+    all_passed : bool
+        True if LICQ, strict complementarity, and SOSC all hold.
+    """
+    licq: bool
+    licq_sigma_min: float
+    strict_complementarity: bool
+    sc_min_active_mult: float
+    sc_degenerate: list
+    sosc: bool
+    sosc_min_eigenvalue: float
+    active_set_summary: dict
+    all_passed: bool
+
+
+def check_regularity(
+    wec,
+    res,
+    waves,
+    obj_fun=None,
+    *,
+    active_tol: float = 1e-6,
+    licq_tol: float = 1e-8,
+    sc_tol: float = 1e-8,
+    sosc_tol: float = -1e-6,
+    verbose: bool = True,
+) -> RegularityResult:
+    """Check NLP regularity conditions required by Fiacco's theorem.
+
+    Evaluates at the optimal solution ``(x*, lambda*)`` stored in *res*:
+
+    1. **LICQ** — active constraint gradients are linearly independent
+       (smallest singular value of active Jacobian > *licq_tol*).
+    2. **Strict complementarity** — every active inequality has
+       ``|mu_i| > sc_tol``.
+    3. **SOSC** — the reduced Hessian of the Lagrangian (projected onto
+       the null space of the active constraint Jacobian) is positive
+       definite (min eigenvalue > *sosc_tol*).
+
+    Parameters
+    ----------
+    wec : WEC_IPOPT
+        WEC instance (provides ``residual``, ``constraints``, etc.).
+    res : OptimizeResult
+        Result from :meth:`WEC_IPOPT.solve` (carries multipliers).
+    waves : xarray.DataArray
+        Wave data used in the solve.
+    obj_fun : callable, optional
+        Objective function ``obj_fun(wec, x_wec, x_opt, wave) -> scalar``.
+        Required for SOSC check. If None, SOSC uses only constraint terms
+        (may undercount curvature).
+    active_tol : float
+        Constraint is "active" if ``|g_i(x*)| < active_tol``
+        (for inequality constraints, ``|g_i(x*) - bound| < active_tol``).
+    licq_tol : float
+        Minimum singular value threshold for LICQ.
+    sc_tol : float
+        Minimum |multiplier| for strict complementarity.
+    sosc_tol : float
+        Minimum eigenvalue of the reduced Hessian for SOSC.
+        Slightly negative default allows for numerical noise.
+    verbose : bool
+        Print a detailed report.
+
+    Returns
+    -------
+    RegularityResult
+        Named tuple with per-check results and ``all_passed``.
+    """
+    from .solver_ipopt import _extract_all_realizations
+
+    _, wave_list = _extract_all_realizations(
+        waves, wec._hydro_data["Froude_Krylov_force"])
+    wave = wave_list[0]
+
+    x_star = np.array(res.x)
+    n = len(x_star)
+    x_wec, x_opt = wec.decompose_state(x_star)
+    ci = res.constraint_info
+
+    # ── 1. Build full constraint Jacobian and identify active set ─────
+
+    # Dynamics equality constraints (always active)
+    dyn_jac_fn = jax.jacobian(
+        lambda x: wec.residual(*wec.decompose_state(x), wave))
+    J_dyn = np.array(dyn_jac_fn(jnp.array(x_star)))     # (n_dyn, n)
+    n_dyn = J_dyn.shape[0]
+
+    # User inequality constraints
+    active_ineq_rows = []
+    active_ineq_names = []
+    active_ineq_mults = []
+    n_total_ineq = 0
+
+    for i, icons in enumerate(wec.constraints):
+        cname = f"user_constraint_{i}"
+        cinfo = ci[cname]
+        g_vals = res.constraint_values[cinfo["slice"]]
+        mu_vals = res.constraint_multipliers.get(cname, np.zeros_like(g_vals))
+        n_total_ineq += len(g_vals)
+
+        jac_fn = jax.jacobian(
+            lambda x, _ic=icons: jnp.atleast_1d(
+                _ic["fun"](wec, *wec.decompose_state(x), wave)))
+
+        for j in range(len(g_vals)):
+            is_ineq = cinfo["type"] == "ineq"
+            if is_ineq and abs(g_vals[j]) < active_tol:
+                row = np.array(jac_fn(jnp.array(x_star)))[j]
+                active_ineq_rows.append(row)
+                active_ineq_names.append(f"{cname}[{j}]")
+                active_ineq_mults.append(float(mu_vals[j]))
+
+    # Variable bound constraints
+    if hasattr(res, 'mult_x_L') and hasattr(res, 'mult_x_U'):
+        for k in range(n):
+            if abs(res.mult_x_L[k]) > sc_tol:
+                row = np.zeros(n)
+                row[k] = -1.0  # x_k >= lb  →  -x_k + lb <= 0
+                active_ineq_rows.append(row)
+                active_ineq_names.append(f"x_lower[{k}]")
+                active_ineq_mults.append(float(res.mult_x_L[k]))
+            if abs(res.mult_x_U[k]) > sc_tol:
+                row = np.zeros(n)
+                row[k] = 1.0  # x_k <= ub  →  x_k - ub <= 0
+                active_ineq_rows.append(row)
+                active_ineq_names.append(f"x_upper[{k}]")
+                active_ineq_mults.append(float(res.mult_x_U[k]))
+
+    n_active_ineq = len(active_ineq_rows)
+
+    # Stack active constraint Jacobian: [J_dynamics; J_active_ineq]
+    if n_active_ineq > 0:
+        J_ineq = np.array(active_ineq_rows)  # (n_active_ineq, n)
+        J_active = np.vstack([J_dyn, J_ineq])
+    else:
+        J_active = J_dyn
+
+    # ── 2. LICQ check ────────────────────────────────────────────────
+    if J_active.shape[0] > 0:
+        sv = la.svdvals(J_active)
+        sigma_min = float(sv[-1]) if len(sv) > 0 else float('inf')
+    else:
+        sigma_min = float('inf')
+
+    licq_ok = sigma_min > licq_tol
+
+    # ── 3. Strict complementarity ────────────────────────────────────
+    sc_degenerate = []
+    sc_min_active = float('inf')
+    for name, mu in zip(active_ineq_names, active_ineq_mults):
+        if abs(mu) < sc_tol:
+            sc_degenerate.append(name)
+        sc_min_active = min(sc_min_active, abs(mu))
+
+    if n_active_ineq == 0:
+        sc_min_active = float('inf')
+
+    sc_ok = len(sc_degenerate) == 0
+
+    # ── 4. SOSC — reduced Hessian on null space of active Jacobian ───
+    lag_fn = _build_lagrangian(wec, wave, res, obj_fun=obj_fun)
+    H_lag = np.array(jax.hessian(lag_fn)(jnp.array(x_star)))
+
+    if J_active.shape[0] < n:
+        Z = la.null_space(J_active)  # (n, n-m) where m = # active constraints
+        if Z.shape[1] > 0:
+            H_red = Z.T @ H_lag @ Z
+            eigvals = la.eigvalsh(H_red)
+            min_eig = float(eigvals[0])
+        else:
+            min_eig = float('inf')
+    else:
+        min_eig = float('inf')
+
+    sosc_ok = min_eig > sosc_tol
+
+    # ── 5. Assemble result ───────────────────────────────────────────
+    active_summary = {
+        "n_active_ineq": n_active_ineq,
+        "n_total_ineq": n_total_ineq,
+        "n_dynamics": n_dyn,
+        "n_bound_active": sum(1 for n in active_ineq_names if n.startswith("x_")),
+        "active_names": active_ineq_names,
+    }
+
+    result = RegularityResult(
+        licq=licq_ok,
+        licq_sigma_min=sigma_min,
+        strict_complementarity=sc_ok,
+        sc_min_active_mult=sc_min_active,
+        sc_degenerate=sc_degenerate,
+        sosc=sosc_ok,
+        sosc_min_eigenvalue=min_eig,
+        active_set_summary=active_summary,
+        all_passed=licq_ok and sc_ok and sosc_ok,
+    )
+
+    if verbose:
+        _print_regularity(result)
+
+    return result
+
+
+def _build_lagrangian(wec, wave, res, obj_fun=None):
+    """Build the KKT Lagrangian L(x) = f(x) + λ^T h(x) + μ^T g(x)."""
+    ci = res.constraint_info
+    dyn_slice = ci["dynamics"]["slice"]
+    lam_dyn = jnp.array(res.mult_g[dyn_slice])
+
+    ineq_slices = {}
+    for cname, cinfo in ci.items():
+        if cname == "dynamics":
+            continue
+        ineq_slices[cname] = (cinfo["slice"],
+                              jnp.array(res.mult_g[cinfo["slice"]]))
+
+    def lagrangian(x):
+        x_wec, x_opt = wec.decompose_state(x)
+
+        # Objective
+        L = jnp.float64(0.0)
+        if obj_fun is not None:
+            L = L + obj_fun(wec, x_wec, x_opt, wave)
+
+        # Dynamics equality constraints
+        r = wec.residual(x_wec, x_opt, wave)
+        L = L + jnp.dot(lam_dyn, r)
+
+        # User inequality constraints
+        for i, icons in enumerate(wec.constraints):
+            cname = f"user_constraint_{i}"
+            if cname in ineq_slices:
+                sl, mu = ineq_slices[cname]
+                g = jnp.atleast_1d(icons["fun"](wec, x_wec, x_opt, wave))
+                L = L + jnp.dot(mu, g)
+
+        return L
+
+    return lagrangian
+
+
+def _print_regularity(r: RegularityResult):
+    """Print a formatted regularity report."""
+    W = 74
+    print("=" * W)
+    print("  NLP Regularity Checks (Fiacco Sensitivity Prerequisites)")
+    print("=" * W)
+
+    s = r.active_set_summary
+    print(f"\n  Active set:")
+    print(f"    Dynamics (equality):     {s['n_dynamics']} constraints")
+    print(f"    Inequality active:       {s['n_active_ineq']} / "
+          f"{s['n_total_ineq']} constraints")
+    print(f"    Variable bounds active:  {s['n_bound_active']}")
+    if s['active_names']:
+        shown = s['active_names'][:10]
+        print(f"    Active inequality names: {shown}"
+              + (" ..." if len(s['active_names']) > 10 else ""))
+
+    print(f"\n  {'Check':35s} {'Status':8s} {'Value':>14s} {'Threshold':>14s}")
+    print("  " + "-" * (W - 4))
+
+    _print_check("LICQ (σ_min of active Jacobian)",
+                 r.licq, f"{r.licq_sigma_min:.4e}", f"> {1e-8:.0e}")
+    _print_check("Strict complementarity (min |μ|)",
+                 r.strict_complementarity,
+                 f"{r.sc_min_active_mult:.4e}" if r.sc_min_active_mult < float('inf')
+                 else "n/a (no active ineq)",
+                 f"> {1e-8:.0e}")
+    _print_check("SOSC (min eigenvalue reduced H_L)",
+                 r.sosc, f"{r.sosc_min_eigenvalue:.4e}"
+                 if r.sosc_min_eigenvalue < float('inf') else "n/a (fully constrained)",
+                 f"> {-1e-6:.0e}")
+
+    if r.sc_degenerate:
+        print(f"\n  ⚠ Degenerate constraints (active with ~zero multiplier):")
+        for name in r.sc_degenerate[:10]:
+            print(f"    - {name}")
+
+    print("\n  " + "-" * (W - 4))
+    if r.all_passed:
+        print("  RESULT: All regularity conditions satisfied — "
+              "Fiacco sensitivity is valid.")
+    else:
+        failures = []
+        if not r.licq:
+            failures.append("LICQ")
+        if not r.strict_complementarity:
+            failures.append("Strict Complementarity")
+        if not r.sosc:
+            failures.append("SOSC")
+        print(f"  RESULT: FAILED — {', '.join(failures)}. "
+              "Sensitivity gradients may be unreliable.")
+    print("=" * W)
+    print()
+
+
+def _print_check(name: str, passed: bool, value: str, threshold: str):
+    status = "PASS" if passed else "FAIL"
+    print(f"  {name:35s} {status:8s} {value:>14s} {threshold:>14s}")

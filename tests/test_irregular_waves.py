@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 
 import wecopttool as wot
+from wavespectra.construct.frequency import pierson_moskowitz
 from wecopttool_differentiable import (
     WEC_IPOPT,
     sensitivity,
@@ -71,10 +72,11 @@ def irregular_setup():
 
     Tp = 1.0 / wavefreq
     Hs = 0.125
-    spectrum = wot.waves.pierson_moskowitz_spectrum(freq, Tp, Hs)
+    fp = 1.0 / Tp
+    efth = pierson_moskowitz(freq=freq, hs=Hs, fp=fp)
 
     waves = wot.waves.long_crested_wave(
-        spectrum, nrealizations=NREALIZATIONS, direction=0, seed=42)
+        efth, nrealizations=NREALIZATIONS, direction=0, seed=42)
 
     obj_fun = pto.mechanical_average_power
     nstate_opt = 2 * nfreq
