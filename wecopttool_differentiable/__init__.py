@@ -13,6 +13,8 @@ from .solver_ipopt import (
     WEC_IPOPT,
     sensitivity,
     make_differentiable_solver,
+    make_differentiable_state_solver,
+    ffo_sensitivity,
     sensitivity_parametric,
 )
 
@@ -55,6 +57,8 @@ __all__ = [
     "WEC_IPOPT",
     "sensitivity",
     "make_differentiable_solver",
+    "make_differentiable_state_solver",
+    "ffo_sensitivity",
     "sensitivity_parametric",
     # Tier 2 — parametric factories
     "make_joint_params",
