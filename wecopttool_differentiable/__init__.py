@@ -2,7 +2,7 @@
 
 Extension package for Sandia's WecOptTool. Adds:
 - WEC_IPOPT: IPOPT-backed solver that returns Lagrange multipliers
-- sensitivity(): Fiacco post-optimality sensitivity (BEM, PTO, joint)
+- sensitivity(): post-optimality sensitivity (Fiacco or FFO, via target=)
 - make_differentiable_solver(): JAX-differentiable solve via custom_vjp
 
 Requires wecopttool and cyipopt.
@@ -13,9 +13,6 @@ from .solver_ipopt import (
     WEC_IPOPT,
     sensitivity,
     make_differentiable_solver,
-    make_differentiable_state_solver,
-    ffo_sensitivity,
-    sensitivity_parametric,
 )
 
 # -- Tier 2: parametric force / objective factories -------------------------
@@ -52,14 +49,18 @@ from .sensitivity_plots import (
     plot_fd_comparison,
 )
 
+# -- Tier 5: deprecated (backward compatibility) ----------------------------
+from .solver_ipopt import (  # noqa: F811
+    ffo_sensitivity,
+    make_differentiable_state_solver,
+    sensitivity_parametric,
+)
+
 __all__ = [
     # Tier 1 — core
     "WEC_IPOPT",
     "sensitivity",
     "make_differentiable_solver",
-    "make_differentiable_state_solver",
-    "ffo_sensitivity",
-    "sensitivity_parametric",
     # Tier 2 — parametric factories
     "make_joint_params",
     "make_linear_mooring_parametric",
@@ -83,4 +84,8 @@ __all__ = [
     "plot_sensitivity_bars",
     "plot_frequency_sensitivity",
     "plot_fd_comparison",
+    # Tier 5 — deprecated (still importable for backward compat)
+    "ffo_sensitivity",
+    "make_differentiable_state_solver",
+    "sensitivity_parametric",
 ]

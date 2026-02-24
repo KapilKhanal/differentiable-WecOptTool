@@ -469,6 +469,154 @@ def _fix_complex_grad(grad):
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# FFO helpers (used by sensitivity(target="state") and
+# make_differentiable_solver(return_state=True))
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _ffo_perturbed_solve(wec, waves, obj_fun, nstate_opt, res, v,
+                         delta, active_tol, max_retries, solve_kwargs):
+    """Perturb objective by delta*v^T*x, re-solve, check active-set stability."""
+    x_star = np.array(res.x)
+    x_wec_star, x_opt_star = wec.decompose_state(x_star)
+
+    kw = dict(solve_kwargs)
+    kw.setdefault("x_wec_0", x_wec_star)
+    kw.setdefault("x_opt_0", x_opt_star)
+    if "optim_options" not in kw:
+        kw["optim_options"] = {}
+    kw["optim_options"].setdefault("print_level", 0)
+    kw["optim_options"].setdefault("max_iter", 2000)
+    kw["optim_options"].setdefault("tol", 1e-8)
+    kw.setdefault("mult_g_0", res.mult_g)
+    kw.setdefault("mult_x_L_0", res.mult_x_L)
+    kw.setdefault("mult_x_U_0", res.mult_x_U)
+
+    current_delta = delta
+
+    for attempt in range(max_retries):
+        v_scaled = current_delta * v
+
+        def perturbed_obj(wec_obj, x_wec, x_opt, wave,
+                          _vs=v_scaled):
+            base = obj_fun(wec_obj, x_wec, x_opt, wave)
+            x_full = jnp.concatenate([
+                jnp.ravel(x_wec), jnp.ravel(x_opt)])
+            return base + jnp.dot(jnp.array(_vs), x_full)
+
+        results_pert = wec.solve(
+            waves, perturbed_obj, nstate_opt, **kw)
+        res_pert = results_pert[0]
+
+        if not res_pert.success:
+            _log.warning(
+                "FFO perturbed solve did not converge (attempt %d). "
+                "Halving delta.", attempt + 1)
+            current_delta /= 2
+            continue
+
+        ci = res.constraint_info
+        stable = True
+        for cname, cinfo in ci.items():
+            if cname == "dynamics":
+                continue
+            g_orig = res.constraint_values[cinfo["slice"]]
+            g_pert = res_pert.constraint_values[cinfo["slice"]]
+            active_orig = np.abs(g_orig) < active_tol
+            active_pert = np.abs(g_pert) < active_tol
+            if not np.array_equal(active_orig, active_pert):
+                n_changed = int(np.sum(active_orig != active_pert))
+                _log.warning(
+                    "FFO active set changed for %s (%d constraints). "
+                    "Halving delta (attempt %d).",
+                    cname, n_changed, attempt + 1)
+                stable = False
+                break
+
+        if stable:
+            break
+        current_delta /= 2
+    else:
+        _log.warning(
+            "FFO active set unstable after %d retries. "
+            "Proceeding with delta=%.2e.", max_retries, current_delta)
+
+    return res_pert, current_delta
+
+
+def _ffo_lagrangian_grad(wec, params, x_w, x_o, lam, wd, wave,
+                         parametric_forces=None, obj_fn=None,
+                         constraint_mults=None):
+    r"""Full Lagrangian gradient :math:`\nabla_p L` at a given primal-dual point."""
+    x_w_j = jnp.array(x_w)
+    x_o_j = jnp.array(x_o)
+
+    def r_of_p(p):
+        return residual_parametric(
+            x_w_j, x_o_j, wd, p, wec,
+            parametric_forces=parametric_forces)
+
+    _, vjp_fn = jax.vjp(r_of_p, params)
+    (grad_total,) = vjp_fn(lam)
+
+    if obj_fn is not None:
+        def f_of_p(p):
+            return obj_fn(wec, x_w_j, x_o_j, wave, p)
+        grad_f = jax.grad(f_of_p)(params)
+        grad_total = jax.tree_util.tree_map(jnp.add, grad_total, grad_f)
+
+    if constraint_mults is not None:
+        for fn, cname, mu_i in constraint_mults:
+            def g_of_p(p, _fn=fn, _w=wave):
+                return jnp.atleast_1d(_fn(wec, x_w_j, x_o_j, _w, p))
+            _, vjp_g = jax.vjp(g_of_p, params)
+            (grad_g,) = vjp_g(mu_i)
+            grad_total = jax.tree_util.tree_map(jnp.add, grad_total, grad_g)
+
+    return grad_total
+
+
+def _sensitivity_state(
+    wec, res, waves, *, obj_fun, nstate_opt, seed,
+    params=None, parametric_forces=None, obj_fn=None,
+    delta=1e-4, active_tol=1e-6, max_retries=3, **solve_kwargs,
+):
+    """Internal FFO path for sensitivity(target='state')."""
+    x_star = np.array(res.x)
+    v = np.asarray(seed, dtype=np.float64)
+    assert len(v) == len(x_star), (
+        f"Seed has length {len(v)}, expected {len(x_star)}")
+
+    if params is None:
+        params = extract_bem_params(wec._hydro_data)
+
+    wave_data_list, wave_list = _extract_all_realizations(
+        waves, wec._hydro_data["Froude_Krylov_force"])
+    wd_0 = wave_data_list[0]
+    wave_0 = wave_list[0]
+
+    res_pert, current_delta = _ffo_perturbed_solve(
+        wec, waves, obj_fun, nstate_opt, res, v,
+        delta, active_tol, max_retries, solve_kwargs)
+
+    x_wec_star, x_opt_star = wec.decompose_state(x_star)
+    x_wec_pert, x_opt_pert = wec.decompose_state(res_pert.x)
+    lam_star = jnp.array(res.dynamics_mult_g)
+    lam_pert = jnp.array(res_pert.dynamics_mult_g)
+
+    grad_orig = _ffo_lagrangian_grad(
+        wec, params, x_wec_star, x_opt_star, lam_star, wd_0, wave_0,
+        parametric_forces=parametric_forces, obj_fn=obj_fn)
+    grad_pert = _ffo_lagrangian_grad(
+        wec, params, x_wec_pert, x_opt_pert, lam_pert, wd_0, wave_0,
+        parametric_forces=parametric_forces, obj_fn=obj_fn)
+
+    result = jax.tree_util.tree_map(
+        lambda gp, go: (gp - go) / current_delta, grad_pert, grad_orig)
+
+    return _fix_complex_grad(result)
+
+
 def sensitivity(
     wec,
     results,
@@ -480,14 +628,28 @@ def sensitivity(
     residual_fn=None,
     constraint_fns=None,
     obj_fun_parametric=None,
+    # --- dispatch ---
+    target="objective",
+    # --- FFO-only (target="state") ---
+    seed=None,
+    obj_fun=None,
+    nstate_opt=None,
+    delta=1e-4,
+    active_tol=1e-6,
+    max_retries=3,
+    **solve_kwargs,
 ):
-    r"""Compute the Fiacco sensitivity :math:`d\varphi^*/dp`.
+    r"""Compute post-optimality sensitivity.
 
-    Standalone function (Option B). Requires *wec* with ``_hydro_data``
-    and *results* with ``dynamics_mult_g`` (from :class:`WEC_IPOPT.solve`).
+    Unified entry point for two kinds of sensitivity:
 
-    Unified API for BEM, PTO, or joint (BEM + PTO) sensitivity.
-    Averaged over wave realisations when multiple are present.
+    * ``target="objective"`` *(default)* — **Fiacco** envelope theorem.
+      Returns :math:`d\varphi^*/dp` (gradient of optimal objective w.r.t.
+      parameters).  No extra NLP solve needed.
+
+    * ``target="state"`` — **FFO** (Fully First-Order) adjoint.
+      Returns :math:`v^\top \, dx^*/dp` (state Jacobian-vector product).
+      Requires one extra perturbed NLP re-solve.
 
     Parameters
     ----------
@@ -497,18 +659,43 @@ def sensitivity(
         Result(s) from :meth:`wec.solve`.
     waves : xarray.DataArray
         The wave data used in the solve.
-    params, parametric_forces, additional_forces, obj_fn, residual_fn,
-    constraint_fns, obj_fun_parametric
-        Same as the original wecopttool sensitivity API (see source).
+    target : ``"objective"`` or ``"state"``
+        What to differentiate.
+    params : namedtuple, optional
+        Parameter pytree.  If ``None``, uses BEM-only parameters.
+    parametric_forces : dict, optional
+        Parametric force functions
+        ``{name: f(wec, x_wec, x_opt, wave, params)}``.
+    obj_fn : callable, optional
+        Parametric objective ``obj_fn(wec, x_wec, x_opt, wave, params)``.
+    additional_forces, residual_fn, constraint_fns, obj_fun_parametric
+        Fiacco-specific / legacy parameters (ignored when
+        ``target="state"``).
+    seed : array, optional
+        Seed vector *v*, same length as ``res.x``.  **Required** when
+        ``target="state"``.
+    obj_fun : callable, optional
+        NLP objective ``obj_fun(wec, x_wec, x_opt, wave) -> scalar``.
+        **Required** when ``target="state"``.
+    nstate_opt : int, optional
+        Number of optimisation state variables.
+        **Required** when ``target="state"``.
+    delta, active_tol, max_retries
+        FFO perturbation parameters (only used when ``target="state"``).
+    **solve_kwargs
+        Forwarded to :meth:`WEC_IPOPT.solve` during FFO re-solve.
 
     Returns
     -------
     pytree
-        Gradient with same structure as *params* (BEMParams when params=None).
-        For complex-valued parameters (e.g. Froude-Krylov, diffraction),
-        ``Re(grad)`` = sensitivity to real part, ``Im(grad)`` = sensitivity
-        to imaginary part.
+        When ``target="objective"``: gradient :math:`d\varphi^*/dp`.
+        When ``target="state"``: contraction :math:`v^\top dx^*/dp`.
+        Same pytree structure as *params*.
     """
+    if target not in ("objective", "state"):
+        raise ValueError(
+            f"target must be 'objective' or 'state', got {target!r}.")
+
     if not hasattr(wec, "_hydro_data"):
         raise AttributeError(
             "sensitivity() requires _hydro_data.  "
@@ -523,6 +710,28 @@ def sensitivity(
                 f"results[{idx}] is missing 'dynamics_mult_g'. "
                 "Use WEC_IPOPT.solve() (not WEC.solve) to obtain "
                 "Lagrange multipliers.")
+
+    # ── FFO dispatch ──────────────────────────────────────────────────
+    if target == "state":
+        if seed is None:
+            raise ValueError(
+                "sensitivity(target='state') requires 'seed' — a vector "
+                "of the same length as res.x.")
+        if obj_fun is None:
+            raise ValueError(
+                "sensitivity(target='state') requires 'obj_fun' — the "
+                "NLP objective function.")
+        if nstate_opt is None:
+            raise ValueError(
+                "sensitivity(target='state') requires 'nstate_opt'.")
+
+        return _sensitivity_state(
+            wec, results[0], waves, obj_fun=obj_fun,
+            nstate_opt=nstate_opt, seed=seed,
+            params=params, parametric_forces=parametric_forces,
+            obj_fn=obj_fn, delta=delta, active_tol=active_tol,
+            max_retries=max_retries, **solve_kwargs)
+    # ── Fiacco (target="objective") continues below ───────────────────
 
     if params is not None and isinstance(params, dict):
         raise TypeError(
@@ -749,19 +958,63 @@ def make_differentiable_solver(
     obj_fun: TStateFunction,
     nstate_opt: int,
     obj_fun_parametric=None,
+    *,
+    return_state: bool = False,
+    ffo_delta: float = 1e-4,
+    active_tol: float = 1e-6,
     **solve_kwargs,
 ):
-    r"""Return a JAX-differentiable function ``f(bem_params) -> phi_star``.
+    r"""Return a JAX-differentiable function of BEM parameters.
 
-    The returned callable runs IPOPT in the **forward** pass and uses
-    the Fiacco / envelope-theorem formula in the **backward** pass so
-    that :func:`jax.grad` works transparently.
+    Unified entry point for two differentiation strategies:
+
+    * ``return_state=False`` *(default)* — returns ``f(params) -> phi_star``
+      (scalar optimal objective).  Uses **Fiacco** backward (no extra solve).
+
+    * ``return_state=True`` — returns ``f(params) -> x_star`` (full optimal
+      state vector).  Uses **FFO** backward (one extra perturbed NLP solve).
+
+    Parameters
+    ----------
+    wec : WEC_IPOPT
+        WEC instance with ``_hydro_data``.
+    waves : xarray.DataArray
+        Wave data.
+    obj_fun : callable
+        Objective ``obj_fun(wec, x_wec, x_opt, wave) -> scalar``.
+    nstate_opt : int
+        Number of optimisation state variables.
+    obj_fun_parametric : callable, optional
+        Parametric objective for the Fiacco backward (ignored when
+        ``return_state=True``).
+    return_state : bool
+        If ``False``, return ``f(p) -> phi*`` (Fiacco).
+        If ``True``, return ``f(p) -> x*`` (FFO).
+    ffo_delta : float
+        Perturbation size for FFO backward (only when ``return_state=True``).
+    active_tol : float
+        Active-set stability tolerance (only when ``return_state=True``).
+    **solve_kwargs
+        Extra keyword arguments for :meth:`WEC_IPOPT.solve`.
+
+    Returns
+    -------
+    callable
+        ``f(bem_params) -> scalar`` or ``f(bem_params) -> array``
+        depending on *return_state*.  Has a custom VJP so
+        :func:`jax.grad` works transparently.
     """
     if not hasattr(wec, "_hydro_data"):
         raise AttributeError(
             "make_differentiable_solver requires _hydro_data on the WEC.  "
             "Build the WEC_IPOPT via from_bem().")
 
+    if return_state:
+        return _make_differentiable_state_solver(
+            wec, waves, obj_fun, nstate_opt,
+            ffo_delta=ffo_delta, active_tol=active_tol, **solve_kwargs)
+
+    # ── Fiacco path: f(params) -> φ* ─────────────────────────────────
     wave_data_list, _ = _extract_all_realizations(
         waves, wec._hydro_data["Froude_Krylov_force"])
     nreal = len(wave_data_list)
@@ -854,251 +1107,72 @@ def make_differentiable_solver(
     return solve
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# FFO: Fully First-Order Differentiable Optimization adjoint for dx*/dp
-# ═══════════════════════════════════════════════════════════════════════════
-
 def ffo_sensitivity(
-    wec: WEC_IPOPT,
-    res: OptimizeResult,
-    waves: DataArray,
-    obj_fun: TStateFunction,
-    nstate_opt: int,
-    v: np.ndarray,
-    *,
-    delta: float = 1e-4,
-    active_tol: float = 1e-6,
-    max_retries: int = 3,
-    **solve_kwargs,
-) -> "BEMParams":
-    r"""Compute :math:`v^\top \, \partial x^*/\partial p` via FFO.
+    wec, res, waves, obj_fun, nstate_opt, v, *,
+    params=None, parametric_forces=None, obj_fn=None,
+    delta=1e-4, active_tol=1e-6, max_retries=3, **solve_kwargs,
+):
+    r"""Compute :math:`v^\top dx^*/dp` via FFO.
 
-    Uses the Fully First-Order Differentiable Optimization (FFO) method:
-    perturb the objective by :math:`\delta \, v^\top x`, re-solve the NLP,
-    and finite-difference the Lagrangian gradient w.r.t. parameters.
-
-    This gives the *state* sensitivity (how optimal design variables
-    change with parameters), contracted with seed vector *v*.  Combined
-    with ``jax.custom_vjp``, this enables differentiating any downstream
-    function of :math:`x^*` through the NLP solve.
-
-    Parameters
-    ----------
-    wec : WEC_IPOPT
-        WEC instance with ``_hydro_data``.
-    res : OptimizeResult
-        Result from :meth:`WEC_IPOPT.solve` (carries x*, λ*).
-    waves : xarray.DataArray
-        Wave data used in the solve.
-    obj_fun : callable
-        Objective function ``obj_fun(wec, x_wec, x_opt, wave) -> scalar``.
-    nstate_opt : int
-        Number of optimisation state variables.
-    v : array
-        Seed vector, same length as ``res.x``.  In reverse-mode AD
-        this is :math:`\partial J_{\text{outer}} / \partial x^*`.
-    delta : float
-        Perturbation size for FFO.  Typically 1e-4 to 1e-6.
-    active_tol : float
-        Tolerance for active-set stability check.
-    max_retries : int
-        Number of times to halve delta if active set changes.
-    **solve_kwargs
-        Extra keyword arguments forwarded to :meth:`WEC_IPOPT.solve`.
-
-    Returns
-    -------
-    BEMParams (or pytree matching wec's parameter structure)
-        The contraction :math:`v^\top \partial x^*/\partial p`,
-        with the same pytree structure as ``extract_bem_params()``.
+    .. deprecated::
+        Use ``sensitivity(wec, res, waves, target='state', seed=v,
+        obj_fun=obj_fun, nstate_opt=nstate_opt, ...)`` instead.
     """
-    if not hasattr(wec, "_hydro_data"):
-        raise AttributeError(
-            "ffo_sensitivity requires _hydro_data on the WEC.  "
-            "Build the WEC_IPOPT via from_bem().")
+    warnings.warn(
+        "ffo_sensitivity() is deprecated. "
+        "Use sensitivity(wec, res, waves, target='state', "
+        "seed=v, obj_fun=obj_fun, nstate_opt=nstate_opt, ...) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return sensitivity(
+        wec, res, waves,
+        target="state", seed=v,
+        obj_fun=obj_fun, nstate_opt=nstate_opt,
+        params=params, parametric_forces=parametric_forces,
+        obj_fn=obj_fn, delta=delta, active_tol=active_tol,
+        max_retries=max_retries, **solve_kwargs,
+    )
 
-    x_star = np.array(res.x)
-    v = np.asarray(v, dtype=np.float64)
-    assert len(v) == len(x_star), (
-        f"Seed v has length {len(v)}, expected {len(x_star)}")
 
-    x_wec_star, x_opt_star = wec.decompose_state(x_star)
+def _make_differentiable_state_solver(
+    wec, waves, obj_fun, nstate_opt, *,
+    ffo_delta=1e-4, active_tol=1e-6, **solve_kwargs,
+):
+    """Internal FFO path for make_differentiable_solver(return_state=True)."""
 
     wave_data_list, wave_list = _extract_all_realizations(
         waves, wec._hydro_data["Froude_Krylov_force"])
-    wave_0 = wave_list[0]
-    wd_0 = wave_data_list[0]
-
-    bp = extract_bem_params(wec._hydro_data)
-
-    # Warm-start the perturbed solve from the original solution
-    kw = dict(solve_kwargs)
-    kw.setdefault("x_wec_0", x_wec_star)
-    kw.setdefault("x_opt_0", x_opt_star)
-    if "optim_options" not in kw:
-        kw["optim_options"] = {}
-    kw["optim_options"].setdefault("print_level", 0)
-    kw["optim_options"].setdefault("max_iter", 2000)
-    kw["optim_options"].setdefault("tol", 1e-8)
-    # Warm-start duals
-    kw.setdefault("mult_g_0", res.mult_g)
-    kw.setdefault("mult_x_L_0", res.mult_x_L)
-    kw.setdefault("mult_x_U_0", res.mult_x_U)
-
-    current_delta = delta
-
-    for attempt in range(max_retries):
-        v_scaled = current_delta * v
-
-        def perturbed_obj(wec_obj, x_wec, x_opt, wave):
-            base = obj_fun(wec_obj, x_wec, x_opt, wave)
-            x_full = jnp.concatenate([
-                jnp.ravel(x_wec), jnp.ravel(x_opt)])
-            return base + jnp.dot(jnp.array(v_scaled), x_full)
-
-        results_pert = wec.solve(
-            waves, perturbed_obj, nstate_opt, **kw)
-        res_pert = results_pert[0]
-
-        if not res_pert.success:
-            _log.warning(
-                "FFO perturbed solve did not converge (attempt %d). "
-                "Halving delta.", attempt + 1)
-            current_delta /= 2
-            continue
-
-        # Active-set stability check
-        ci = res.constraint_info
-        stable = True
-        for cname, cinfo in ci.items():
-            if cname == "dynamics":
-                continue
-            g_orig = res.constraint_values[cinfo["slice"]]
-            g_pert = res_pert.constraint_values[cinfo["slice"]]
-            active_orig = np.abs(g_orig) < active_tol
-            active_pert = np.abs(g_pert) < active_tol
-            if not np.array_equal(active_orig, active_pert):
-                n_changed = int(np.sum(active_orig != active_pert))
-                _log.warning(
-                    "FFO active set changed for %s (%d constraints). "
-                    "Halving delta (attempt %d).",
-                    cname, n_changed, attempt + 1)
-                stable = False
-                break
-
-        if stable:
-            break
-        current_delta /= 2
-    else:
-        _log.warning(
-            "FFO active set unstable after %d retries. "
-            "Proceeding with delta=%.2e.", max_retries, current_delta)
-
-    # Lagrangian gradient w.r.t. parameters at original and perturbed solutions
-    x_wec_pert, x_opt_pert = wec.decompose_state(res_pert.x)
-    lam_star = jnp.array(res.dynamics_mult_g)
-    lam_pert = jnp.array(res_pert.dynamics_mult_g)
-
-    def lagrangian_grad_p(x_w, x_o, lam, wd):
-        """∇_p L = λ^T ∂r/∂p  (dynamics Lagrangian w.r.t. BEM params)."""
-        def r_of_p(p):
-            return residual_parametric(
-                jnp.array(x_w), jnp.array(x_o), wd, p, wec)
-        _, vjp_fn = jax.vjp(r_of_p, bp)
-        (grad,) = vjp_fn(lam)
-        return grad
-
-    grad_orig = lagrangian_grad_p(x_wec_star, x_opt_star, lam_star, wd_0)
-    grad_pert = lagrangian_grad_p(x_wec_pert, x_opt_pert, lam_pert, wd_0)
-
-    # FFO finite difference: v^T dx*/dp ≈ (∇_p L_pert - ∇_p L_orig) / delta
-    result = jax.tree_util.tree_map(
-        lambda gp, go: (gp - go) / current_delta, grad_pert, grad_orig)
-
-    return _fix_complex_grad(result)
-
-
-def make_differentiable_state_solver(
-    wec: WEC_IPOPT,
-    waves: DataArray,
-    obj_fun: TStateFunction,
-    nstate_opt: int,
-    *,
-    ffo_delta: float = 1e-4,
-    active_tol: float = 1e-6,
-    **solve_kwargs,
-):
-    r"""Return a JAX-differentiable function ``f(bem_params) -> x_star``.
-
-    The returned callable runs IPOPT in the **forward** pass and uses
-    the FFO (First-order Forward-mode Optimization) method in the
-    **backward** pass, enabling :func:`jax.grad` of any function that
-    consumes the optimal design variables :math:`x^*`.
-
-    Unlike :func:`make_differentiable_solver` (which returns only
-    :math:`\varphi^*` and uses Fiacco for the backward), this returns
-    the full state vector and uses one extra NLP re-solve per backward
-    call.
-
-    Parameters
-    ----------
-    wec : WEC_IPOPT
-        WEC instance with ``_hydro_data``.
-    waves : xarray.DataArray
-        Wave data.
-    obj_fun : callable
-        Objective ``obj_fun(wec, x_wec, x_opt, wave) -> scalar``.
-    nstate_opt : int
-        Number of optimisation state variables.
-    ffo_delta : float
-        Perturbation size for FFO backward pass.
-    active_tol : float
-        Tolerance for active-set stability check.
-    **solve_kwargs
-        Extra keyword arguments for :meth:`WEC_IPOPT.solve`.
-
-    Returns
-    -------
-    callable
-        ``f(bem_params) -> x_star`` (JAX array of length nstate_wec + nstate_opt).
-        Has a custom VJP so ``jax.grad(lambda p: g(f(p)))(p0)`` works.
-    """
-    if not hasattr(wec, "_hydro_data"):
-        raise AttributeError(
-            "make_differentiable_state_solver requires _hydro_data.  "
-            "Build the WEC_IPOPT via from_bem().")
-
-    wave_data_list, _ = _extract_all_realizations(
-        waves, wec._hydro_data["Froude_Krylov_force"])
     nreal = len(wave_data_list)
 
-    _warm = {"x_wec_0": None, "x_opt_0": None}
+    _ffo_state = {"x_wec_0": None, "x_opt_0": None, "constraint_info": None}
 
     def _resolve_kwargs():
         kw = dict(solve_kwargs)
-        if _warm["x_wec_0"] is not None and "x_wec_0" not in kw:
-            kw["x_wec_0"] = _warm["x_wec_0"]
-        if _warm["x_opt_0"] is not None and "x_opt_0" not in kw:
-            kw["x_opt_0"] = _warm["x_opt_0"]
+        if _ffo_state["x_wec_0"] is not None and "x_wec_0" not in kw:
+            kw["x_wec_0"] = _ffo_state["x_wec_0"]
+        if _ffo_state["x_opt_0"] is not None and "x_opt_0" not in kw:
+            kw["x_opt_0"] = _ffo_state["x_opt_0"]
         return kw
 
-    def _update_warm(results):
+    def _update_ffo_state(results):
         res = results[-1]
         x_w, x_o = wec.decompose_state(res.x)
-        _warm["x_wec_0"] = np.asarray(x_w)
-        _warm["x_opt_0"] = np.asarray(x_o)
+        _ffo_state["x_wec_0"] = np.asarray(x_w)
+        _ffo_state["x_opt_0"] = np.asarray(x_o)
+        _ffo_state["constraint_info"] = res.constraint_info
 
     @jax.custom_vjp
     def solve(bem_params):
         results = wec.solve(
             waves, obj_fun, nstate_opt, **_resolve_kwargs())
-        _update_warm(results)
+        _update_ffo_state(results)
         return jnp.array(results[0].x, dtype=jnp.float64)
 
     def solve_fwd(bem_params):
         results = wec.solve(
             waves, obj_fun, nstate_opt, **_resolve_kwargs())
-        _update_warm(results)
+        _update_ffo_state(results)
         res = results[0]
         x_star = jnp.array(res.x, dtype=jnp.float64)
 
@@ -1118,56 +1192,68 @@ def make_differentiable_state_solver(
         bp, x_star, lam_dyn, mult_g, mult_x_L, mult_x_U, g_vals = residuals
         v = np.asarray(g)
 
-        x_wec_star, x_opt_star = wec.decompose_state(np.asarray(x_star))
+        # Build a mock OptimizeResult for the shared helper
+        mock_res = OptimizeResult()
+        mock_res.x = np.asarray(x_star)
+        mock_res.dynamics_mult_g = np.asarray(lam_dyn)
+        mock_res.mult_g = np.asarray(mult_g)
+        mock_res.mult_x_L = np.asarray(mult_x_L)
+        mock_res.mult_x_U = np.asarray(mult_x_U)
+        mock_res.constraint_values = np.asarray(g_vals)
+        mock_res.constraint_info = _ffo_state["constraint_info"]
+        mock_res.constraint_multipliers = {}
+        ci = mock_res.constraint_info
+        for cname, cinfo in ci.items():
+            if cname == "dynamics":
+                continue
+            mock_res.constraint_multipliers[cname] = (
+                mock_res.mult_g[cinfo["slice"]])
+        mock_res.success = True
+
+        res_pert, used_delta = _ffo_perturbed_solve(
+            wec, waves, obj_fun, nstate_opt, mock_res, v,
+            ffo_delta, active_tol, 3, solve_kwargs)
+
         wd_0 = wave_data_list[0]
-
-        # Warm-start perturbed solve from original solution
-        kw = dict(solve_kwargs)
-        kw["x_wec_0"] = x_wec_star
-        kw["x_opt_0"] = x_opt_star
-        if "optim_options" not in kw:
-            kw["optim_options"] = {}
-        kw["optim_options"].setdefault("print_level", 0)
-        kw["optim_options"].setdefault("max_iter", 2000)
-        kw["optim_options"].setdefault("tol", 1e-8)
-        kw["mult_g_0"] = np.asarray(mult_g)
-        kw["mult_x_L_0"] = np.asarray(mult_x_L)
-        kw["mult_x_U_0"] = np.asarray(mult_x_U)
-
-        v_scaled = ffo_delta * v
-
-        def perturbed_obj(wec_obj, x_wec, x_opt, wave):
-            base = obj_fun(wec_obj, x_wec, x_opt, wave)
-            x_full = jnp.concatenate([
-                jnp.ravel(x_wec), jnp.ravel(x_opt)])
-            return base + jnp.dot(jnp.array(v_scaled), x_full)
-
-        results_pert = wec.solve(
-            waves, perturbed_obj, nstate_opt, **kw)
-        res_pert = results_pert[0]
-
+        wave_0 = wave_list[0]
+        x_wec_star, x_opt_star = wec.decompose_state(np.asarray(x_star))
         x_wec_pert, x_opt_pert = wec.decompose_state(res_pert.x)
-        lam_pert = jnp.array(res_pert.dynamics_mult_g)
 
-        def lagrangian_grad_p(x_w, x_o, lam):
-            def r_of_p(p):
-                return residual_parametric(
-                    jnp.array(x_w), jnp.array(x_o), wd_0, p, wec)
-            _, vjp_fn = jax.vjp(r_of_p, bp)
-            (grad,) = vjp_fn(lam)
-            return grad
-
-        grad_orig = lagrangian_grad_p(
-            x_wec_star, x_opt_star, jnp.array(lam_dyn))
-        grad_pert = lagrangian_grad_p(
-            x_wec_pert, x_opt_pert, lam_pert)
+        grad_orig = _ffo_lagrangian_grad(
+            wec, bp, x_wec_star, x_opt_star,
+            jnp.array(lam_dyn), wd_0, wave_0)
+        grad_pert = _ffo_lagrangian_grad(
+            wec, bp, x_wec_pert, x_opt_pert,
+            jnp.array(res_pert.dynamics_mult_g), wd_0, wave_0)
 
         result = jax.tree_util.tree_map(
-            lambda gp, go: (gp - go) / ffo_delta, grad_pert, grad_orig)
+            lambda gp, go: (gp - go) / used_delta, grad_pert, grad_orig)
 
         return (_fix_complex_grad(result),)
 
     solve.defvjp(solve_fwd, solve_bwd)
-    solve.warm_start_state = _warm
+    solve.warm_start_state = _ffo_state
 
     return solve
+
+
+def make_differentiable_state_solver(
+    wec, waves, obj_fun, nstate_opt, *,
+    ffo_delta=1e-4, active_tol=1e-6, **solve_kwargs,
+):
+    r"""Return ``f(params) -> x_star`` with FFO backward.
+
+    .. deprecated::
+        Use ``make_differentiable_solver(..., return_state=True)`` instead.
+    """
+    warnings.warn(
+        "make_differentiable_state_solver() is deprecated. "
+        "Use make_differentiable_solver(..., return_state=True) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return make_differentiable_solver(
+        wec, waves, obj_fun, nstate_opt,
+        return_state=True, ffo_delta=ffo_delta,
+        active_tol=active_tol, **solve_kwargs,
+    )
