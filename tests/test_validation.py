@@ -23,6 +23,7 @@ from wecopttool_differentiable import (
     fd_check_residual,
     fd_check_objective,
     FDResult,
+    CrossCheckResult,
 )
 from wecopttool_differentiable.parametric import extract_wave_data
 from wecopttool_differentiable.parametric_utils import (
@@ -126,6 +127,15 @@ class TestFDResult:
     def test_namedtuple(self):
         r = FDResult("test", 1.0, 1.01, 0.01, True)
         assert r.name == "test"
+        assert r.passed is True
+
+
+class TestCrossCheckResult:
+    def test_namedtuple(self):
+        r = CrossCheckResult("K", 1.23e-3, 1.24e-3, 8.1e-3, True)
+        assert r.name == "K"
+        assert r.fiacco == 1.23e-3
+        assert r.kkt_chain == 1.24e-3
         assert r.passed is True
 
 

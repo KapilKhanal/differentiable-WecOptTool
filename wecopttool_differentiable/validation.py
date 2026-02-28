@@ -1,4 +1,4 @@
-"""Validation utilities for Fiacco post-optimality sensitivity analysis.
+"""Validation utilities for post-optimality sensitivity analysis.
 
 Finite-difference validation (three levels):
 
@@ -12,9 +12,16 @@ Finite-difference validation (three levels):
 3. :func:`fd_check_objective` — verify ``df/dp`` against FD of the
    objective.  No re-solve needed.
 
+Cross-method consistency (solver-independent):
+
+4. :func:`cross_check_fiacco_kkt` — verify Fiacco and KKT agree via the
+   total-derivative identity
+   ``d phi*/dp = df/dp + (df/dx) @ (dx*/dp)``.
+   No finite-difference re-solve needed.
+
 NLP regularity checks (required for Fiacco theorem validity):
 
-4. :func:`check_regularity` — verify LICQ, strict complementarity,
+5. :func:`check_regularity` — verify LICQ, strict complementarity,
    SOSC, and active-set stability at the optimal solution.
 """
 
@@ -24,6 +31,7 @@ __all__ = [
     "fd_validate",
     "fd_check_residual",
     "fd_check_objective",
+    "cross_check_fiacco_kkt",
     "make_re_solve_fn",
     "validate_sensitivity",
     "check_regularity",
@@ -41,10 +49,33 @@ _log = logging.getLogger(__name__)
 
 
 class FDResult(NamedTuple):
-    """Result for a single parameter."""
+    """Result for a single parameter from finite-difference check."""
     name: str
     analytical: float
     fd: float
+    rel_error: float
+    passed: bool
+
+
+class CrossCheckResult(NamedTuple):
+    """Per-parameter result from Fiacco vs KKT cross-consistency check.
+
+    Attributes
+    ----------
+    name : str
+        Parameter field name.
+    fiacco : float
+        ``d phi*/dp`` from Fiacco (envelope theorem).
+    kkt_chain : float
+        ``df/dp + (df/dx) @ (dx*/dp)`` reconstructed via KKT.
+    rel_error : float
+        Relative error between the two.
+    passed : bool
+        Whether rel_error < tolerance.
+    """
+    name: str
+    fiacco: float
+    kkt_chain: float
     rel_error: float
     passed: bool
 
@@ -335,6 +366,179 @@ def fd_check_objective(
     return results
 
 
+def cross_check_fiacco_kkt(
+    wec,
+    res,
+    waves,
+    obj_fun,
+    nstate_opt: int,
+    fiacco_grad,
+    *,
+    params=None,
+    parametric_forces=None,
+    obj_fn=None,
+    fields: Optional[Sequence[str]] = None,
+    tol: float = 0.05,
+    active_tol: float = 1e-6,
+    verbose: bool = True,
+) -> Dict[str, CrossCheckResult]:
+    r"""Cross-consistency check between Fiacco and KKT -- no FD re-solve.
+
+    Exploits the total-derivative identity:
+
+    .. math::
+
+        \frac{d\varphi^*}{dp}
+        = \frac{\partial f}{\partial p}
+          + \frac{\partial f}{\partial x}\,\frac{dx^*}{dp}
+
+    The left-hand side comes from Fiacco (``fiacco_grad``).  The
+    right-hand side is reconstructed by:
+
+    1. Computing :math:`\partial f / \partial x` at the optimum (JAX grad).
+    2. Using :func:`kkt_vjp` with seed :math:`v = \nabla_x f` to get
+       :math:`v^\top dx^*/dp`.
+    3. Adding :math:`\partial f / \partial p` (JAX grad).
+
+    If both sides match, it is a **solver-independent proof** that
+    Fiacco and KKT are mutually consistent.
+
+    Parameters
+    ----------
+    wec : WEC_IPOPT
+        WEC instance.
+    res : OptimizeResult
+        Single result from :meth:`wec.solve`.
+    waves : xarray.DataArray
+        Wave data used in the solve.
+    obj_fun : callable
+        NLP objective ``obj_fun(wec, x_wec, x_opt, wave) -> scalar``.
+    nstate_opt : int
+        Number of optimisation state variables.
+    fiacco_grad : namedtuple / pytree
+        Gradient from :func:`sensitivity`.
+    params : namedtuple, optional
+        Parameter pytree.  Defaults to BEM-only.
+    parametric_forces : dict, optional
+        Parametric force functions (same as passed to :func:`sensitivity`).
+    obj_fn : callable, optional
+        Parametric objective ``obj_fn(wec, x_wec, x_opt, wave, params)``.
+    fields : sequence of str, optional
+        Which parameter fields to compare.  Defaults to all.
+    tol : float
+        Relative error threshold for pass/fail.
+    active_tol : float
+        Active constraint tolerance for the KKT system.
+    verbose : bool
+        Print a comparison table.
+
+    Returns
+    -------
+    dict[str, CrossCheckResult]
+        Per-parameter results.
+    """
+    from .parametric import extract_bem_params, extract_wave_data
+    from .solver_ipopt import _extract_all_realizations
+    from .qp_kkt import kkt_vjp
+
+    if params is None:
+        params = extract_bem_params(wec._hydro_data)
+
+    if fields is None:
+        fields = params._fields
+
+    # ---- 1. Compute df/dx at the optimum --------------------------------
+    _, wave_list = _extract_all_realizations(
+        waves, wec._hydro_data["Froude_Krylov_force"])
+    wave_0 = wave_list[0]
+
+    x_wec, x_opt = wec.decompose_state(res.x)
+    x_wec_j = jnp.array(x_wec)
+    x_opt_j = jnp.array(x_opt)
+
+    def f_of_x(x_full):
+        nw = len(x_wec)
+        return obj_fun(wec, x_full[:nw], x_full[nw:], wave_0)
+
+    x_star = jnp.concatenate([x_wec_j, x_opt_j])
+    df_dx = jax.grad(f_of_x)(x_star)
+    seed = np.asarray(df_dx, dtype=np.float64)
+
+    # ---- 2. KKT VJP with seed = df/dx --> (df/dx)^T (dx*/dp) -----------
+    wave_data_list, _ = _extract_all_realizations(
+        waves, wec._hydro_data["Froude_Krylov_force"])
+    wd_0 = wave_data_list[0]
+
+    vjp_fn, _, _, info = kkt_vjp(
+        wec, res, wave_0, obj_fun, wd_0, params,
+        active_tol=active_tol, sign=1.0)
+
+    kkt_grad = vjp_fn(seed)
+
+    if verbose:
+        _log.info("KKT cross-check: cond=%.2e, n_active=%d",
+                  info["kkt_cond"], info["n_active_ineq"])
+
+    # ---- 3. Compute df/dp at the optimum --------------------------------
+    if obj_fn is not None:
+        def f_of_p(p):
+            return obj_fn(wec, x_wec_j, x_opt_j, wave_0, p)
+        df_dp = jax.grad(f_of_p)(params)
+    else:
+        df_dp = jax.tree_util.tree_map(jnp.zeros_like, params)
+
+    # ---- 4. Reconstruct: d phi*/dp = df/dp + (df/dx)^T (dx*/dp) --------
+    kkt_total = jax.tree_util.tree_map(jnp.add, df_dp, kkt_grad)
+
+    # ---- 5. Compare against Fiacco --------------------------------------
+    results = {}
+    for field in fields:
+        fiacco_arr = jnp.asarray(getattr(fiacco_grad, field))
+        kkt_arr = jnp.asarray(getattr(kkt_total, field))
+        fiacco_val = float(jnp.real(jnp.sum(fiacco_arr)))
+        kkt_val = float(jnp.real(jnp.sum(kkt_arr)))
+
+        denom = max(abs(fiacco_val), abs(kkt_val), 1e-20)
+        rel_err = abs(fiacco_val - kkt_val) / denom
+        passed = rel_err < tol
+
+        results[field] = CrossCheckResult(
+            name=field,
+            fiacco=fiacco_val,
+            kkt_chain=kkt_val,
+            rel_error=rel_err,
+            passed=passed,
+        )
+
+    if verbose:
+        _print_cross_table(results, tol)
+
+    return results
+
+
+def _print_cross_table(results: Dict[str, CrossCheckResult], tol: float):
+    """Pretty-print a Fiacco vs KKT cross-check table."""
+    hdr = (f"  {'Parameter':25s} {'Fiacco':>14s} "
+           f"{'KKT chain':>14s} {'Rel Error':>12s}")
+    sep = "  " + "-" * 70
+    print(hdr)
+    print(sep)
+    all_passed = True
+    for r in results.values():
+        status = "OK" if r.passed else "FAIL"
+        if not r.passed:
+            all_passed = False
+        print(f"  {r.name:25s} {r.fiacco:14.4e} {r.kkt_chain:14.4e} "
+              f"{r.rel_error:12.2e}  {status}")
+    print(sep)
+    if all_passed:
+        print(f"  All parameters passed (tol={tol:.0%})")
+    else:
+        n_fail = sum(1 for r in results.values() if not r.passed)
+        print(f"  {n_fail} parameter(s) FAILED (tol={tol:.0%})")
+    print()
+
+
 def _print_table(results: Dict[str, FDResult], tol: float):
     """Pretty-print a validation comparison table."""
     hdr = f"  {'Parameter':25s} {'Analytical':>14s} {'FD':>14s} {'Rel Error':>12s}"
@@ -417,6 +621,9 @@ def validate_sensitivity(
     additional_forces=None,
     obj_fn=None,
     re_solve_fn=None,
+    obj_fun=None,
+    nstate_opt=None,
+    cross_check_tol: float = 0.05,
     fields=None,
     residual_tol: float = 0.05,
     objective_tol: float = 0.05,
@@ -428,11 +635,16 @@ def validate_sensitivity(
     Automatically selects which checks to run based on the arguments
     provided:
 
-    - **Residual check** — runs when *params* and *parametric_forces*
+    - **Residual check** -- runs when *params* and *parametric_forces*
       are given (validates :math:`\\lambda^T \\partial r / \\partial p`).
-    - **Objective check** — runs when *params* and *obj_fn* are given
+    - **Objective check** -- runs when *params* and *obj_fn* are given
       (validates :math:`\\partial f / \\partial p`).
-    - **Full NLP re-solve** — runs when *re_solve_fn* is given
+    - **Cross-consistency** -- runs when *obj_fun* and *nstate_opt* are
+      given.  Compares Fiacco's :math:`d\\varphi^*/dp` against the
+      chain-rule reconstruction via KKT
+      (:math:`\\partial f/\\partial p + (\\partial f/\\partial x) \\cdot
+      dx^*/dp`).  **Solver-independent** -- no FD re-solve needed.
+    - **Full NLP re-solve** -- runs when *re_solve_fn* is given
       (validates the complete Fiacco gradient via central FD).
 
     Parameters
@@ -456,6 +668,14 @@ def validate_sensitivity(
     re_solve_fn : callable, optional
         ``re_solve_fn(params_dict) -> float`` for full NLP re-solve
         (see :func:`make_re_solve_fn`).
+    obj_fun : callable, optional
+        NLP objective ``obj_fun(wec, x_wec, x_opt, wave) -> scalar``.
+        Required for cross-consistency check.
+    nstate_opt : int, optional
+        Number of optimisation state variables.
+        Required for cross-consistency check.
+    cross_check_tol : float
+        Tolerance for the Fiacco vs KKT cross-check.
     fields : sequence of str, optional
         Parameter fields to check (default: all).
     residual_tol, objective_tol, resolve_tol : float
@@ -467,7 +687,8 @@ def validate_sensitivity(
     -------
     dict[str, dict]
         Nested dict keyed by check name (``'residual'``, ``'objective'``,
-        ``'resolve'``), each containing per-parameter :class:`FDResult`.
+        ``'cross_check'``, ``'resolve'``), each containing per-parameter
+        :class:`FDResult` or :class:`CrossCheckResult`.
     """
     from scipy.optimize import OptimizeResult
 
@@ -501,6 +722,24 @@ def validate_sensitivity(
             obj_fn=obj_fn,
             fields=fields,
             tol=objective_tol,
+            verbose=verbose,
+        )
+
+    if obj_fun is not None and nstate_opt is not None:
+        if verbose:
+            print("=" * 74)
+            print("  Cross-consistency: Fiacco vs KKT (chain rule)")
+            print("=" * 74)
+        report["cross_check"] = cross_check_fiacco_kkt(
+            wec, res, waves,
+            obj_fun=obj_fun,
+            nstate_opt=nstate_opt,
+            fiacco_grad=analytical_grad,
+            params=params,
+            parametric_forces=parametric_forces,
+            obj_fn=obj_fn,
+            fields=fields,
+            tol=cross_check_tol,
             verbose=verbose,
         )
 

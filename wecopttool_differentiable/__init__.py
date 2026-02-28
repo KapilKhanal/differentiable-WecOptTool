@@ -29,10 +29,12 @@ from .validation import (
     fd_validate,
     fd_check_residual,
     fd_check_objective,
+    cross_check_fiacco_kkt,
     make_re_solve_fn,
     validate_sensitivity,
     check_regularity,
     FDResult,
+    CrossCheckResult,
     RegularityResult,
 )
 
@@ -65,10 +67,12 @@ __all__ = [
     "fd_validate",
     "fd_check_residual",
     "fd_check_objective",
+    "cross_check_fiacco_kkt",
     "make_re_solve_fn",
     "validate_sensitivity",
     "check_regularity",
     "FDResult",
+    "CrossCheckResult",
     "RegularityResult",
     # Tier 4 — advanced / internals
     "BEMParams",
