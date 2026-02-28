@@ -28,10 +28,12 @@ from .validation import (
     fd_validate,
     fd_check_residual,
     fd_check_objective,
+    cross_check_fiacco_ffo,
     make_re_solve_fn,
     validate_sensitivity,
     check_regularity,
     FDResult,
+    CrossCheckResult,
     RegularityResult,
 )
 
@@ -43,6 +45,7 @@ from .parametric import (
     extract_wave_data,
     residual_parametric,
 )
+from .qp_kkt import kkt_vjp
 from .sensitivity_plots import (
     plot_sensitivity_bars,
     plot_frequency_sensitivity,
@@ -70,10 +73,12 @@ __all__ = [
     "fd_validate",
     "fd_check_residual",
     "fd_check_objective",
+    "cross_check_fiacco_ffo",
     "make_re_solve_fn",
     "validate_sensitivity",
     "check_regularity",
     "FDResult",
+    "CrossCheckResult",
     "RegularityResult",
     # Tier 4 — advanced / internals
     "BEMParams",
@@ -84,6 +89,7 @@ __all__ = [
     "plot_sensitivity_bars",
     "plot_frequency_sensitivity",
     "plot_fd_comparison",
+    "kkt_vjp",
     # Tier 5 — deprecated (still importable for backward compat)
     "ffo_sensitivity",
     "make_differentiable_state_solver",

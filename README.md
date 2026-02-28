@@ -130,7 +130,7 @@ report = validate_sensitivity(
 ```python
 from wecopttool_differentiable import fd_validate, make_re_solve_fn
 
-re_solve = make_re_solve_fn(wec_factory, waves, obj_fun, nstate_opt, **solve_kw)
+re_solve = make_re_solve_fn(wec_factory, waves, obj_fun, nstate_opt, res=res, **solve_kw)
 results = fd_validate(grad_pto, pto_params, re_solve)
 ```
 

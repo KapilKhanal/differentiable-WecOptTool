@@ -1,4 +1,9 @@
-"""Tests for validation utilities (fd_validate, fd_check_residual, fd_check_objective).
+"""Tests for validation utilities.
+
+Covers fd_validate, fd_check_residual, fd_check_objective, and
+CrossCheckResult.  The full cross_check_fiacco_ffo integration test
+lives in test_wavebot_sensitivity.py (requires Capytaine + converging
+IPOPT solve).
 
 Run with::
 
@@ -21,6 +26,7 @@ from wecopttool_differentiable import (
     fd_check_residual,
     fd_check_objective,
     FDResult,
+    CrossCheckResult,
 )
 from wecopttool_differentiable.parametric import extract_wave_data
 from wecopttool_differentiable.parametric_utils import (
@@ -127,6 +133,15 @@ class TestFDResult:
         assert r.passed is True
 
 
+class TestCrossCheckResult:
+    def test_namedtuple(self):
+        r = CrossCheckResult("K", 1.23e-3, 1.24e-3, 8.1e-3, True)
+        assert r.name == "K"
+        assert r.fiacco == 1.23e-3
+        assert r.ffo_chain == 1.24e-3
+        assert r.passed is True
+
+
 class TestFdCheckResidual:
     def test_mooring_residual_matches_fd(self, wec_and_res, wave):
         wec, res, _ = wec_and_res
@@ -187,3 +202,5 @@ class TestFdValidate:
         for r in results.values():
             assert isinstance(r, FDResult)
             assert r.passed, f"{r.name}: rel_error={r.rel_error:.2e}"
+
+

@@ -476,21 +476,26 @@ def _fix_complex_grad(grad):
 
 def _ffo_perturbed_solve(wec, waves, obj_fun, nstate_opt, res, v,
                          delta, active_tol, max_retries, solve_kwargs):
-    """Perturb objective by delta*v^T*x, re-solve, check active-set stability."""
+    """Perturb objective by delta*v^T*x, re-solve, check active-set stability.
+
+    Warm-starts the perturbed solve from the baseline result's primal
+    ``(x_wec*, x_opt*)`` and dual ``(mult_g, mult_x_L, mult_x_U)``
+    variables so IPOPT converges to the *same* local optimum.
+    """
     x_star = np.array(res.x)
     x_wec_star, x_opt_star = wec.decompose_state(x_star)
 
     kw = dict(solve_kwargs)
     kw.setdefault("x_wec_0", x_wec_star)
     kw.setdefault("x_opt_0", x_opt_star)
+    kw.setdefault("mult_g_0", res.mult_g)
+    kw.setdefault("mult_x_L_0", res.mult_x_L)
+    kw.setdefault("mult_x_U_0", res.mult_x_U)
     if "optim_options" not in kw:
         kw["optim_options"] = {}
     kw["optim_options"].setdefault("print_level", 0)
     kw["optim_options"].setdefault("max_iter", 2000)
     kw["optim_options"].setdefault("tol", 1e-8)
-    kw.setdefault("mult_g_0", res.mult_g)
-    kw.setdefault("mult_x_L_0", res.mult_x_L)
-    kw.setdefault("mult_x_U_0", res.mult_x_U)
 
     current_delta = delta
 
@@ -508,10 +513,13 @@ def _ffo_perturbed_solve(wec, waves, obj_fun, nstate_opt, res, v,
             waves, perturbed_obj, nstate_opt, **kw)
         res_pert = results_pert[0]
 
-        if not res_pert.success:
+        # IPOPT status 0 = optimal, 1 = acceptable tolerance — both OK
+        converged = res_pert.success or getattr(res_pert, "status", -1) == 1
+        if not converged:
             _log.warning(
-                "FFO perturbed solve did not converge (attempt %d). "
-                "Halving delta.", attempt + 1)
+                "FFO perturbed solve did not converge (attempt %d, "
+                "status %d). Halving delta.",
+                attempt + 1, getattr(res_pert, "status", -1))
             current_delta /= 2
             continue
 
@@ -960,19 +968,27 @@ def make_differentiable_solver(
     obj_fun_parametric=None,
     *,
     return_state: bool = False,
+    backward_strategy: str = "auto",
     ffo_delta: float = 1e-4,
     active_tol: float = 1e-6,
     **solve_kwargs,
 ):
     r"""Return a JAX-differentiable function of BEM parameters.
 
-    Unified entry point for two differentiation strategies:
+    Unified entry point for differentiation strategies:
 
     * ``return_state=False`` *(default)* — returns ``f(params) -> phi_star``
       (scalar optimal objective).  Uses **Fiacco** backward (no extra solve).
 
     * ``return_state=True`` — returns ``f(params) -> x_star`` (full optimal
-      state vector).  Uses **FFO** backward (one extra perturbed NLP solve).
+      state vector).  The backward pass is chosen by *backward_strategy*:
+
+      - ``"kkt"`` — differentiate through the KKT conditions directly.
+        One matrix factorisation, no re-solves, handles active-set
+        changes analytically.  **Recommended.**
+      - ``"ffo"`` — perturb objective, re-solve, finite-difference.
+        Original FFO method; requires active-set stability.
+      - ``"auto"`` *(default)* — uses ``"kkt"``.
 
     Parameters
     ----------
@@ -989,11 +1005,13 @@ def make_differentiable_solver(
         ``return_state=True``).
     return_state : bool
         If ``False``, return ``f(p) -> phi*`` (Fiacco).
-        If ``True``, return ``f(p) -> x*`` (FFO).
+        If ``True``, return ``f(p) -> x*`` (KKT or FFO).
+    backward_strategy : str
+        ``"kkt"`` | ``"ffo"`` | ``"auto"`` (only when ``return_state=True``).
     ffo_delta : float
-        Perturbation size for FFO backward (only when ``return_state=True``).
+        Perturbation size for FFO backward (only ``backward_strategy="ffo"``).
     active_tol : float
-        Active-set stability tolerance (only when ``return_state=True``).
+        Active constraint tolerance.
     **solve_kwargs
         Extra keyword arguments for :meth:`WEC_IPOPT.solve`.
 
@@ -1009,7 +1027,14 @@ def make_differentiable_solver(
             "make_differentiable_solver requires _hydro_data on the WEC.  "
             "Build the WEC_IPOPT via from_bem().")
 
+    if backward_strategy == "auto":
+        backward_strategy = "kkt"
+
     if return_state:
+        if backward_strategy == "kkt":
+            return _make_differentiable_state_solver_kkt(
+                wec, waves, obj_fun, nstate_opt,
+                active_tol=active_tol, **solve_kwargs)
         return _make_differentiable_state_solver(
             wec, waves, obj_fun, nstate_opt,
             ffo_delta=ffo_delta, active_tol=active_tol, **solve_kwargs)
@@ -1019,7 +1044,10 @@ def make_differentiable_solver(
         waves, wec._hydro_data["Froude_Krylov_force"])
     nreal = len(wave_data_list)
 
-    _warm = {"x_wec_0": None, "x_opt_0": None}
+    _warm = {
+        "x_wec_0": None, "x_opt_0": None,
+        "mult_g": None, "mult_x_L": None, "mult_x_U": None,
+    }
 
     def _resolve_kwargs():
         kw = dict(solve_kwargs)
@@ -1027,6 +1055,12 @@ def make_differentiable_solver(
             kw["x_wec_0"] = _warm["x_wec_0"]
         if _warm["x_opt_0"] is not None and "x_opt_0" not in kw:
             kw["x_opt_0"] = _warm["x_opt_0"]
+        if _warm["mult_g"] is not None and "mult_g_0" not in kw:
+            kw["mult_g_0"] = _warm["mult_g"]
+        if _warm["mult_x_L"] is not None and "mult_x_L_0" not in kw:
+            kw["mult_x_L_0"] = _warm["mult_x_L"]
+        if _warm["mult_x_U"] is not None and "mult_x_U_0" not in kw:
+            kw["mult_x_U_0"] = _warm["mult_x_U"]
         return kw
 
     def _update_warm(results):
@@ -1034,6 +1068,9 @@ def make_differentiable_solver(
         x_w, x_o = wec.decompose_state(res.x)
         _warm["x_wec_0"] = np.asarray(x_w)
         _warm["x_opt_0"] = np.asarray(x_o)
+        _warm["mult_g"] = np.asarray(res.mult_g)
+        _warm["mult_x_L"] = np.asarray(res.mult_x_L)
+        _warm["mult_x_U"] = np.asarray(res.mult_x_U)
 
     @jax.custom_vjp
     def solve(bem_params):
@@ -1135,6 +1172,114 @@ def ffo_sensitivity(
     )
 
 
+def _make_differentiable_state_solver_kkt(
+    wec, waves, obj_fun, nstate_opt, *,
+    active_tol=1e-6, **solve_kwargs,
+):
+    """Internal KKT path for make_differentiable_solver(return_state=True).
+
+    Replaces the FFO perturbed-solve backward with direct differentiation
+    through the KKT optimality conditions.  No re-solves, no delta-halving.
+    """
+    from .qp_kkt import kkt_vjp
+
+    wave_data_list, wave_list = _extract_all_realizations(
+        waves, wec._hydro_data["Froude_Krylov_force"])
+    nreal = len(wave_data_list)
+
+    _kkt_state = {
+        "x_wec_0": None, "x_opt_0": None, "constraint_info": None,
+        "mult_g": None, "mult_x_L": None, "mult_x_U": None,
+    }
+
+    def _resolve_kwargs():
+        kw = dict(solve_kwargs)
+        if _kkt_state["x_wec_0"] is not None and "x_wec_0" not in kw:
+            kw["x_wec_0"] = _kkt_state["x_wec_0"]
+        if _kkt_state["x_opt_0"] is not None and "x_opt_0" not in kw:
+            kw["x_opt_0"] = _kkt_state["x_opt_0"]
+        if _kkt_state["mult_g"] is not None and "mult_g_0" not in kw:
+            kw["mult_g_0"] = _kkt_state["mult_g"]
+        if _kkt_state["mult_x_L"] is not None and "mult_x_L_0" not in kw:
+            kw["mult_x_L_0"] = _kkt_state["mult_x_L"]
+        if _kkt_state["mult_x_U"] is not None and "mult_x_U_0" not in kw:
+            kw["mult_x_U_0"] = _kkt_state["mult_x_U"]
+        return kw
+
+    def _update_state(results):
+        res = results[-1]
+        x_w, x_o = wec.decompose_state(res.x)
+        _kkt_state["x_wec_0"] = np.asarray(x_w)
+        _kkt_state["x_opt_0"] = np.asarray(x_o)
+        _kkt_state["constraint_info"] = res.constraint_info
+        _kkt_state["mult_g"] = np.asarray(res.mult_g)
+        _kkt_state["mult_x_L"] = np.asarray(res.mult_x_L)
+        _kkt_state["mult_x_U"] = np.asarray(res.mult_x_U)
+
+    @jax.custom_vjp
+    def solve(bem_params):
+        results = wec.solve(
+            waves, obj_fun, nstate_opt, **_resolve_kwargs())
+        _update_state(results)
+        return jnp.array(results[0].x, dtype=jnp.float64)
+
+    def solve_fwd(bem_params):
+        results = wec.solve(
+            waves, obj_fun, nstate_opt, **_resolve_kwargs())
+        _update_state(results)
+        res = results[0]
+        x_star = jnp.array(res.x, dtype=jnp.float64)
+
+        residuals = (
+            bem_params,
+            x_star,
+            jnp.array(res.dynamics_mult_g, dtype=jnp.float64),
+            jnp.array(res.mult_g, dtype=jnp.float64),
+            jnp.array(res.mult_x_L, dtype=jnp.float64),
+            jnp.array(res.mult_x_U, dtype=jnp.float64),
+            jnp.array(res.constraint_values, dtype=jnp.float64),
+        )
+        return x_star, residuals
+
+    def solve_bwd(residuals, g):
+        """KKT backward: g is the seed dJ/dx* from downstream."""
+        bp, x_star, lam_dyn, mult_g_all, mult_x_L, mult_x_U, g_vals = residuals
+        v = np.asarray(g)
+
+        mock_res = OptimizeResult()
+        mock_res.x = np.asarray(x_star)
+        mock_res.dynamics_mult_g = np.asarray(lam_dyn)
+        mock_res.mult_g = np.asarray(mult_g_all)
+        mock_res.mult_x_L = np.asarray(mult_x_L)
+        mock_res.mult_x_U = np.asarray(mult_x_U)
+        mock_res.constraint_values = np.asarray(g_vals)
+        mock_res.constraint_info = _kkt_state["constraint_info"]
+        mock_res.constraint_multipliers = {}
+        ci = mock_res.constraint_info
+        for cname, cinfo in ci.items():
+            if cname == "dynamics":
+                continue
+            mock_res.constraint_multipliers[cname] = (
+                mock_res.mult_g[cinfo["slice"]])
+        mock_res.success = True
+
+        wave_0 = wave_list[0]
+        wd_0 = wave_data_list[0]
+
+        vjp_fn, _, _, info = kkt_vjp(
+            wec, mock_res, wave_0, obj_fun, wd_0, bp,
+            active_tol=active_tol, sign=1.0)
+
+        grad_p = vjp_fn(v)
+
+        return (_fix_complex_grad(grad_p),)
+
+    solve.defvjp(solve_fwd, solve_bwd)
+    solve.warm_start_state = _kkt_state
+
+    return solve
+
+
 def _make_differentiable_state_solver(
     wec, waves, obj_fun, nstate_opt, *,
     ffo_delta=1e-4, active_tol=1e-6, **solve_kwargs,
@@ -1145,7 +1290,10 @@ def _make_differentiable_state_solver(
         waves, wec._hydro_data["Froude_Krylov_force"])
     nreal = len(wave_data_list)
 
-    _ffo_state = {"x_wec_0": None, "x_opt_0": None, "constraint_info": None}
+    _ffo_state = {
+        "x_wec_0": None, "x_opt_0": None, "constraint_info": None,
+        "mult_g": None, "mult_x_L": None, "mult_x_U": None,
+    }
 
     def _resolve_kwargs():
         kw = dict(solve_kwargs)
@@ -1153,6 +1301,12 @@ def _make_differentiable_state_solver(
             kw["x_wec_0"] = _ffo_state["x_wec_0"]
         if _ffo_state["x_opt_0"] is not None and "x_opt_0" not in kw:
             kw["x_opt_0"] = _ffo_state["x_opt_0"]
+        if _ffo_state["mult_g"] is not None and "mult_g_0" not in kw:
+            kw["mult_g_0"] = _ffo_state["mult_g"]
+        if _ffo_state["mult_x_L"] is not None and "mult_x_L_0" not in kw:
+            kw["mult_x_L_0"] = _ffo_state["mult_x_L"]
+        if _ffo_state["mult_x_U"] is not None and "mult_x_U_0" not in kw:
+            kw["mult_x_U_0"] = _ffo_state["mult_x_U"]
         return kw
 
     def _update_ffo_state(results):
@@ -1161,6 +1315,9 @@ def _make_differentiable_state_solver(
         _ffo_state["x_wec_0"] = np.asarray(x_w)
         _ffo_state["x_opt_0"] = np.asarray(x_o)
         _ffo_state["constraint_info"] = res.constraint_info
+        _ffo_state["mult_g"] = np.asarray(res.mult_g)
+        _ffo_state["mult_x_L"] = np.asarray(res.mult_x_L)
+        _ffo_state["mult_x_U"] = np.asarray(res.mult_x_U)
 
     @jax.custom_vjp
     def solve(bem_params):
