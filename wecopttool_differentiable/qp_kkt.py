@@ -15,12 +15,12 @@ Given a solved NLP with primal ``x*`` and dual ``(λ*, μ*)``:
 3. Chains through :func:`residual_parametric` via ``jax.vjp`` for the
    actual parameter gradient.
 
-This replaces FFO's fragile perturbed-solve backward with a single
-factorisation + back-substitution.  No re-solves, no delta-halving,
+Direct KKT differentiation: a single matrix factorisation +
+back-substitution.  No re-solves, no delta-halving,
 no active-set stability checks.
 
 The user-facing API is unchanged — this is wired into
-:func:`make_differentiable_solver` as ``backward_strategy="kkt"``.
+:func:`make_differentiable_solver` with ``return_state=True``.
 """
 
 from __future__ import annotations

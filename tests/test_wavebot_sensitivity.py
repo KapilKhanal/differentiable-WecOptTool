@@ -29,9 +29,7 @@ from wecopttool_differentiable import (
     WEC_IPOPT,
     make_differentiable_solver,
     sensitivity,
-    cross_check_fiacco_ffo,
     BEMParams,
-    CrossCheckResult,
     extract_bem_params,
     extract_wave_data,
     residual_parametric,
@@ -309,64 +307,3 @@ class TestWaveBotConvenienceAPI:
                 atol=1e-5,
                 err_msg=f"make_differentiable_solver mismatch for {name}",
             )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Cross-consistency: Fiacco vs FFO (solver-independent validation)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestWaveBotCrossCheckFiaccoFFO:
-    """Verify d phi*/dp from Fiacco matches df/dp + (df/dx)(dx*/dp) from FFO.
-
-    This is a solver-independent consistency proof: if both methods
-    agree on the total derivative, they are mutually correct.  Uses the
-    same WaveBot setup as Tutorial 1 (constrained, converges in ~28
-    iterations).
-    """
-
-    @pytest.mark.validation
-    def test_cross_check_runs_and_returns_results(self, wavebot_setup):
-        """Verify the cross-check API works end-to-end on WaveBot.
-
-        The constrained WaveBot has active PTO force limits that cause
-        FFO active-set instability, so we only check that the function
-        runs, returns the right types, and produces finite values.
-        Numerical agreement is expected on problems without active
-        inequality constraints (or where the active set is stable under
-        FFO perturbation).
-        """
-        s = wavebot_setup
-
-        fiacco_grad = sensitivity(
-            s["wec"], s["res"], s["waves"],
-            target="objective",
-        )
-
-        results = cross_check_fiacco_ffo(
-            s["wec"], s["res"], s["waves"],
-            obj_fun=s["obj_fun"],
-            nstate_opt=s["nstate_opt"],
-            fiacco_grad=fiacco_grad,
-            tol=0.10,
-            verbose=True,
-            scale_x_wec=s["scale_x_wec"],
-            scale_x_opt=s["scale_x_opt"],
-            scale_obj=s["scale_obj"],
-            optim_options={
-                "max_iter": 5000, "tol": 1e-8, "print_level": 0,
-                "warm_start_init_point": "yes",
-                "warm_start_bound_push": 1e-9,
-                "warm_start_bound_frac": 1e-9,
-                "warm_start_mult_bound_push": 1e-9,
-                "mu_init": 1e-6,
-            },
-        )
-
-        assert isinstance(results, dict)
-        assert len(results) == len(BEMParams._fields)
-        for name, r in results.items():
-            assert isinstance(r, CrossCheckResult)
-            assert r.name == name
-            assert jnp.isfinite(r.fiacco), f"{name}: Fiacco is non-finite"
-            assert jnp.isfinite(r.ffo_chain), f"{name}: FFO chain is non-finite"
-            assert jnp.isfinite(r.rel_error), f"{name}: rel_error is non-finite"

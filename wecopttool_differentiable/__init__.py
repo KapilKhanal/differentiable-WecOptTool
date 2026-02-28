@@ -1,9 +1,10 @@
-"""wecopttool-differentiable: Fiacco sensitivity and JAX differentiability for WecOptTool.
+"""wecopttool-differentiable: Fiacco & KKT sensitivity for WecOptTool.
 
 Extension package for Sandia's WecOptTool. Adds:
 - WEC_IPOPT: IPOPT-backed solver that returns Lagrange multipliers
-- sensitivity(): post-optimality sensitivity (Fiacco or FFO, via target=)
+- sensitivity(): post-optimality Fiacco envelope-theorem gradient
 - make_differentiable_solver(): JAX-differentiable solve via custom_vjp
+  (Fiacco for scalar objective, KKT for full state)
 
 Requires wecopttool and cyipopt.
 """
@@ -28,12 +29,10 @@ from .validation import (
     fd_validate,
     fd_check_residual,
     fd_check_objective,
-    cross_check_fiacco_ffo,
     make_re_solve_fn,
     validate_sensitivity,
     check_regularity,
     FDResult,
-    CrossCheckResult,
     RegularityResult,
 )
 
@@ -52,13 +51,6 @@ from .sensitivity_plots import (
     plot_fd_comparison,
 )
 
-# -- Tier 5: deprecated (backward compatibility) ----------------------------
-from .solver_ipopt import (  # noqa: F811
-    ffo_sensitivity,
-    make_differentiable_state_solver,
-    sensitivity_parametric,
-)
-
 __all__ = [
     # Tier 1 — core
     "WEC_IPOPT",
@@ -73,12 +65,10 @@ __all__ = [
     "fd_validate",
     "fd_check_residual",
     "fd_check_objective",
-    "cross_check_fiacco_ffo",
     "make_re_solve_fn",
     "validate_sensitivity",
     "check_regularity",
     "FDResult",
-    "CrossCheckResult",
     "RegularityResult",
     # Tier 4 — advanced / internals
     "BEMParams",
@@ -90,8 +80,4 @@ __all__ = [
     "plot_frequency_sensitivity",
     "plot_fd_comparison",
     "kkt_vjp",
-    # Tier 5 — deprecated (still importable for backward compat)
-    "ffo_sensitivity",
-    "make_differentiable_state_solver",
-    "sensitivity_parametric",
 ]

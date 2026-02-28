@@ -163,13 +163,13 @@ class TestKKTVJP:
 
 
 class TestMakeDifferentiableSolverKKT:
-    """Test make_differentiable_solver with backward_strategy='kkt'."""
+    """Test make_differentiable_solver with return_state=True (KKT backward)."""
 
     def test_forward_returns_state(self, tutorial1_setup):
         s = tutorial1_setup
         f = make_differentiable_solver(
             s["wec"], s["waves"], s["obj_fun"], s["nstate_opt"],
-            return_state=True, backward_strategy="kkt",
+            return_state=True,
             scale_x_wec=1e1, scale_x_opt=1e-3, scale_obj=1e-2,
             optim_options={"print_level": 0, "max_iter": 1000, "tol": 1e-8},
         )
@@ -181,7 +181,7 @@ class TestMakeDifferentiableSolverKKT:
         s = tutorial1_setup
         f = make_differentiable_solver(
             s["wec"], s["waves"], s["obj_fun"], s["nstate_opt"],
-            return_state=True, backward_strategy="kkt",
+            return_state=True,
             scale_x_wec=1e1, scale_x_opt=1e-3, scale_obj=1e-2,
             optim_options={"print_level": 0, "max_iter": 1000, "tol": 1e-8},
         )
@@ -196,16 +196,3 @@ class TestMakeDifferentiableSolverKKT:
         for name in BEMParams._fields:
             g = getattr(grad_p, name)
             assert jnp.all(jnp.isfinite(g)), f"{name} not finite"
-
-    def test_auto_selects_kkt(self, tutorial1_setup):
-        """backward_strategy='auto' should use KKT (the default)."""
-        s = tutorial1_setup
-        f = make_differentiable_solver(
-            s["wec"], s["waves"], s["obj_fun"], s["nstate_opt"],
-            return_state=True, backward_strategy="auto",
-            scale_x_wec=1e1, scale_x_opt=1e-3, scale_obj=1e-2,
-            optim_options={"print_level": 0, "max_iter": 1000, "tol": 1e-8},
-        )
-        bp = s["bp"]
-        x_star = f(bp)
-        assert x_star.shape == s["res"].x.shape

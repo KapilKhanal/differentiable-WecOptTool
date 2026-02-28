@@ -21,7 +21,6 @@ Run with::
     pytest tests/test_aquaharmonics_sensitivity.py -v
 """
 
-import warnings
 
 import numpy as np
 import pytest
@@ -33,7 +32,6 @@ import wecopttool as wot
 from wecopttool_differentiable import (
     WEC_IPOPT,
     sensitivity,
-    sensitivity_parametric,
     BEMParams,
     extract_bem_params,
     extract_wave_data,
@@ -839,27 +837,6 @@ class TestValidationUtilitiesIntegration:
                 f"rel_error={r.rel_error:.2e}"
             )
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 12. Deprecation warning for sensitivity_parametric
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestDeprecationWarning:
-    """sensitivity_parametric emits DeprecationWarning."""
-
-    def test_sensitivity_parametric_warns(self, ah_setup):
-        s = ah_setup
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            sensitivity_parametric(
-                s["wec"], s["res"], s["waves"],
-                params=s["pto_params_nominal"],
-                residual_fn=lambda wec, xw, xo, wave, p:
-                    jnp.zeros(wec.nstate_wec),
-            )
-            assert len(w) >= 1
-            assert issubclass(w[0].category, DeprecationWarning)
-            assert "sensitivity_parametric" in str(w[0].message)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
