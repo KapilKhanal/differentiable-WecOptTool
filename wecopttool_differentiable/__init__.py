@@ -9,36 +9,12 @@ Extension package for Sandia's WecOptTool. Adds:
 Requires wecopttool and cyipopt.
 """
 
-# -- Tier 1: core solver and sensitivity ------------------------------------
 from .solver_ipopt import (
     WEC_IPOPT,
     sensitivity,
     make_differentiable_solver,
 )
 
-# -- Tier 2: parametric force / objective factories -------------------------
-from .parametric_utils import (
-    make_joint_params,
-    make_linear_mooring_parametric,
-    make_pto_passive_parametric,
-    make_electrical_power_obj_parametric,
-)
-
-# -- Tier 3: validation utilities -------------------------------------------
-from .validation import (
-    fd_validate,
-    fd_check_residual,
-    fd_check_objective,
-    cross_check_fiacco_kkt,
-    make_re_solve_fn,
-    validate_sensitivity,
-    check_regularity,
-    FDResult,
-    CrossCheckResult,
-    RegularityResult,
-)
-
-# -- Tier 4: advanced / internals ------------------------------------------
 from .parametric import (
     BEMParams,
     WaveData,
@@ -46,7 +22,9 @@ from .parametric import (
     extract_wave_data,
     residual_parametric,
 )
+
 from .qp_kkt import kkt_vjp
+
 from .sensitivity_plots import (
     plot_sensitivity_bars,
     plot_frequency_sensitivity,
@@ -54,34 +32,16 @@ from .sensitivity_plots import (
 )
 
 __all__ = [
-    # Tier 1 — core
     "WEC_IPOPT",
     "sensitivity",
     "make_differentiable_solver",
-    # Tier 2 — parametric factories
-    "make_joint_params",
-    "make_linear_mooring_parametric",
-    "make_pto_passive_parametric",
-    "make_electrical_power_obj_parametric",
-    # Tier 3 — validation
-    "fd_validate",
-    "fd_check_residual",
-    "fd_check_objective",
-    "cross_check_fiacco_kkt",
-    "make_re_solve_fn",
-    "validate_sensitivity",
-    "check_regularity",
-    "FDResult",
-    "CrossCheckResult",
-    "RegularityResult",
-    # Tier 4 — advanced / internals
     "BEMParams",
     "WaveData",
     "extract_bem_params",
     "extract_wave_data",
     "residual_parametric",
+    "kkt_vjp",
     "plot_sensitivity_bars",
     "plot_frequency_sensitivity",
     "plot_fd_comparison",
-    "kkt_vjp",
 ]

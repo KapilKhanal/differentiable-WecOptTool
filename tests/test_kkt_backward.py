@@ -17,11 +17,8 @@ from wecopttool_differentiable import (
     WEC_IPOPT,
     sensitivity,
     make_differentiable_solver,
-    cross_check_fiacco_kkt,
     BEMParams,
-    CrossCheckResult,
     extract_bem_params,
-    extract_wave_data,
     kkt_vjp,
 )
 from wecopttool_differentiable.solver_ipopt import _extract_all_realizations
@@ -121,10 +118,8 @@ class TestKKTVJP:
             assert jnp.all(jnp.isfinite(g)), f"{name} has non-finite values"
 
     def test_kkt_agrees_with_fiacco_on_objective(self, tutorial1_setup):
-        """KKT state-level sensitivity, contracted to dφ*/dp, should
-        agree with Fiacco's dφ*/dp.
-
-        dφ*/dp = (dφ/dx)^T dx*/dp, where x = [x_wec; x_opt].
+        """KKT state-level sensitivity, contracted to dphi*/dp, should
+        agree with Fiacco's dphi*/dp.
         """
         s = tutorial1_setup
         wec, res, waves = s["wec"], s["res"], s["waves"]
@@ -143,7 +138,6 @@ class TestKKTVJP:
         x_wec, x_opt = wec.decompose_state(x_star)
         n_wec = len(x_wec)
 
-        # Full-space objective gradient: dφ/dx = [dφ/dx_wec; dφ/dx_opt]
         grad_f_x = np.array(jax.grad(
             lambda x: s["obj_fun"](wec, x[:n_wec], x[n_wec:], wave_0)
         )(jnp.array(x_star)))
@@ -198,34 +192,3 @@ class TestMakeDifferentiableSolverKKT:
         for name in BEMParams._fields:
             g = getattr(grad_p, name)
             assert jnp.all(jnp.isfinite(g)), f"{name} not finite"
-
-
-class TestCrossCheckFiaccoKKT:
-    """Fiacco vs KKT cross-consistency on Tutorial 1 WaveBot.
-
-    d phi*/dp (Fiacco)  ==  df/dp + (df/dx)(dx*/dp) (KKT chain rule)
-    """
-
-    def test_cross_check_all_pass(self, tutorial1_setup):
-        s = tutorial1_setup
-        fiacco_grad = sensitivity(s["wec"], s["res"], s["waves"])
-
-        results = cross_check_fiacco_kkt(
-            s["wec"], s["res"], s["waves"],
-            obj_fun=s["obj_fun"],
-            nstate_opt=s["nstate_opt"],
-            fiacco_grad=fiacco_grad,
-            tol=0.05,
-            verbose=True,
-        )
-
-        assert isinstance(results, dict)
-        assert len(results) == len(BEMParams._fields)
-        for name, r in results.items():
-            assert isinstance(r, CrossCheckResult)
-            assert r.name == name
-            assert jnp.isfinite(r.fiacco), f"{name}: Fiacco non-finite"
-            assert jnp.isfinite(r.kkt_chain), f"{name}: KKT chain non-finite"
-            assert r.passed, (
-                f"{name}: Fiacco={r.fiacco:.4e}, KKT={r.kkt_chain:.4e}, "
-                f"rel_err={r.rel_error:.2e}")

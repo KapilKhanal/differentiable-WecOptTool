@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wecopttool-differentiable"
 version = "0.1.0"
-description = "Fiacco sensitivity and JAX differentiability for WecOptTool"
+description = "Post-optimality sensitivity analysis for WecOptTool via Fiacco envelope theorem and JAX"
 readme = "README.md"
 license = {text = "GPL-3.0-only"}
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [
     {name = "Kapil Khanal"},
 ]
@@ -30,6 +30,8 @@ dependencies = [
 dev = [
     "pytest",
     "jupyter",
+    "matplotlib",
+    "capytaine",
 ]
 
 [tool.pytest.ini_options]
