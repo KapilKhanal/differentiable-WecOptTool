@@ -2,7 +2,7 @@
 
 Extension package for [WecOptTool](https://github.com/sandialabs/WecOptTool) that adds **post-optimality sensitivity analysis** via the Fiacco envelope theorem and JAX automatic differentiation.
 
-Given an optimal WEC control solution from IPOPT, this package computes exact gradients of the optimal objective (e.g., power) with respect to all BEM hydrodynamic parameters — in a single backward pass, without re-solving the optimization problem.
+Given an optimal WEC control solution from IPOPT, this package computes exact gradients of the optimal objective (e.g., power) with respect to all BEM hydrodynamic parameters — in a single backward pass, **without re-solving** the optimization problem.
 
 ## What it does
 
